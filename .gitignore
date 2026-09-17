@@ -1,0 +1,22 @@
+# data, checkpoints, logs, large artefacts — code only
+data/
+outputs/
+logs/
+checkpoints/
+.cache/
+*.pkl
+*.npz
+*.npy
+*.pt
+*.ckpt
+*.tar.gz
+__pycache__/
+*.pyc
+
+# vendored / third-party clones (kept locally, not part of this repo)
+UniPhys/
+TextOp/
+isaacgym/
+vendor_closd/
+vendor_kimodo/
+vendor_motioncraft/
