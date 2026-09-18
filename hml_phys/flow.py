@@ -50,7 +50,7 @@ def masked_smooth_l1(pred, target, mask):
 
 @torch.no_grad()
 def euler_sample(model, x_obs_root, x_obs_body, mask_frames, text, text_uncond, scalars, num_steps=32, cfg_scale=3.5,
-                 v_eps=1e-4, generator=None, valid=None):
+                 v_eps=1e-4, generator=None, valid=None, frame_index=None):
     """x_obs_* : tokens with the history filled (future entries ignored). text / text_uncond: (tokens, pooled, len).
     Returns x0 prediction after the last step (root, body) with observed frames imposed."""
     B, T, _ = x_obs_root.shape
@@ -65,10 +65,11 @@ def euler_sample(model, x_obs_root, x_obs_body, mask_frames, text, text_uncond, 
             zr = torch.cat([z_root, z_root]); zb = torch.cat([z_body, z_body]); mm = torch.cat([mask_frames, mask_frames])
             tok = torch.cat([text_uncond[0], text[0]]); po = torch.cat([text_uncond[1], text[1]]); ln = torch.cat([text_uncond[2], text[2]])
             sc = torch.cat([scalars, scalars]); tt = torch.cat([t, t]); vv = None if valid is None else torch.cat([valid, valid])
-            xr, xb = model(zr, zb, mm, tt, tok, po, ln, sc, valid=vv)
+            fi = None if frame_index is None else torch.cat([frame_index, frame_index])
+            xr, xb = model(zr, zb, mm, tt, tok, po, ln, sc, valid=vv, frame_index=fi)
             xr = xr[:B] + cfg_scale * (xr[B:] - xr[:B]); xb = xb[:B] + cfg_scale * (xb[B:] - xb[:B])
         else:
-            xr, xb = model(z_root, z_body, mask_frames, t, text[0], text[1], text[2], scalars, valid=valid)
+            xr, xb = model(z_root, z_body, mask_frames, t, text[0], text[1], text[2], scalars, valid=valid, frame_index=frame_index)
         if i == num_steps - 1:
             x0r, x0b = xr, xb
             break

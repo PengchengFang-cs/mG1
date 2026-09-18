@@ -19,6 +19,11 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--out", required=True)
 ap.add_argument("--H", type=int, default=16); ap.add_argument("--F", type=int, default=32)
 ap.add_argument("--whole_sequence", action="store_true", help="v2: future = rest of the clip (variable length, capped at F)")
+ap.add_argument("--H_sparse", type=int, default=16, help="v3: sparse distant history slots (0 = no long history)")
+ap.add_argument("--L_max", type=int, default=154, help="v3: history span in frames the sparse part reaches back over")
+ap.add_argument("--alpha", type=float, default=3.0, help="v3: SCRIPT exponential bias (0 = uniform)")
+ap.add_argument("--no_randomize_history", action="store_true", help="keep H_sparse/alpha fixed instead of drawing them per sample")
+ap.add_argument("--local_root", type=int, default=1, help="1: body stage sees the 4-d local root (KiMoDo/ARDY); 0: raw root token")
 ap.add_argument("--hidden", type=int, default=768); ap.add_argument("--heads", type=int, default=8)
 ap.add_argument("--root_depth", default="2,4"); ap.add_argument("--body_depth", default="3,6")
 ap.add_argument("--batch", type=int, default=256); ap.add_argument("--steps", type=int, default=300000)
@@ -32,7 +37,7 @@ ap.add_argument("--w_cons", type=float, default=0.01)
 ap.add_argument("--p_rest", type=float, default=0.1); ap.add_argument("--p_neutral", type=float, default=0.05); ap.add_argument("--sigma_hist", type=float, default=0.0)
 ap.add_argument("--ckpt_every", type=int, default=50000); ap.add_argument("--val_every", type=int, default=5000); ap.add_argument("--val_windows", type=int, default=2048)
 ap.add_argument("--log_every", type=int, default=100); ap.add_argument("--workers", type=int, default=8)
-ap.add_argument("--stats", default=os.path.join(ROOT, "token_stats.npz")); ap.add_argument("--env_constants", default=os.path.join(ROOT, "env_constants.npz"))
+ap.add_argument("--stats", default=os.path.join(ROOT, "token_stats_v3.npz")); ap.add_argument("--env_constants", default=os.path.join(ROOT, "env_constants.npz"))
 ap.add_argument("--resume", default=""); ap.add_argument("--max_clips", type=int, default=0, help="smoke: limit clips"); ap.add_argument("--seed", type=int, default=0)
 args = ap.parse_args()
 
@@ -47,13 +52,15 @@ text_cache = TextCache()
 stats = TokenStats(args.stats)
 env_c = load_env_constants(args.env_constants)
 empty_idx = text_cache.index.get("", -1)
+hist_kw = dict(H_sparse=args.H_sparse, L_max=args.L_max, alpha=args.alpha)
 train_ds = PhysWindowDataset("train", H=args.H, F=args.F, stats_path=args.stats, text_cache=text_cache, env_constants=env_c,
                              p_rest=args.p_rest, p_neutral=args.p_neutral, sigma_hist=args.sigma_hist, seed=args.seed, train=True, max_clips=args.max_clips,
-                             whole_sequence=args.whole_sequence)
+                             whole_sequence=args.whole_sequence, randomize_history=not args.no_randomize_history, **hist_kw)
 val_ds = PhysWindowDataset("val", H=args.H, F=args.F, stats_path=args.stats, text_cache=text_cache, env_constants=env_c, train=False, max_clips=args.max_clips,
-                           whole_sequence=args.whole_sequence)
+                           whole_sequence=args.whole_sequence, randomize_history=False, **hist_kw)
 val_sel = np.random.RandomState(0).choice(len(val_ds), min(args.val_windows, len(val_ds)), replace=False)
-log(f"train windows {len(train_ds)} (short clips skipped {train_ds.n_clips_short}), val windows {len(val_ds)} -> {len(val_sel)} fixed for validation")
+log(f"train windows {len(train_ds)} (short clips skipped {train_ds.n_clips_short}), val windows {len(val_ds)} -> {len(val_sel)} fixed for validation; "
+    f"window layout = [{args.H_sparse} sparse | {args.H} dense | {args.F} future] over L_max {args.L_max} frames, local_root={bool(args.local_root)}")
 coll = lambda b: collate(b, text_cache)
 train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=args.workers, collate_fn=coll, drop_last=True, persistent_workers=True, pin_memory=True)
 val_loader = DataLoader(torch.utils.data.Subset(val_ds, val_sel), batch_size=args.batch, shuffle=False, num_workers=4, collate_fn=coll)
@@ -61,7 +68,9 @@ val_loader = DataLoader(torch.utils.data.Subset(val_ds, val_sel), batch_size=arg
 rd = [int(x) for x in args.root_depth.split(",")]; bd = [int(x) for x in args.body_depth.split(",")]
 model = PhysPolicyDiT(hidden_dim=args.hidden, num_heads=args.heads, root_depth_double=rd[0], root_depth_single=rd[1],
                       body_depth_double=bd[0], body_depth_single=bd[1], text_token_dim=text_cache.tokens.shape[2],
-                      text_pooled_dim=text_cache.dim, max_text_tokens=text_cache.max_tokens).to(dev)
+                      text_pooled_dim=text_cache.dim, max_text_tokens=text_cache.max_tokens,
+                      local_root=bool(args.local_root), root_stats=(stats.root_mean, stats.root_std),
+                      local_root_stats=(stats.local_root_mean, stats.local_root_std)).to(dev)
 log(f"model params {model.num_params()/1e6:.1f}M")
 opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
 ema = {k: v.detach().clone().float() for k, v in model.state_dict().items()}
@@ -92,12 +101,13 @@ def apply_text_dropout(b, p):
 
 def compute_loss(b, train=True, generator=None):
     root, body, mask, valid = b["root"], b["body"], b["observed_mask"], b["valid"]
+    fidx = b["frame_index"]
     B = root.shape[0]
     t = fl.sample_t(B, dev, args.p_mean, args.p_std, generator=generator)
     zr, _, _ = fl.build_state(root, mask, t, generator=generator); zb, _, _ = fl.build_state(body, mask, t, generator=generator)
     scalars = torch.stack([b["progress"], b["total_len"] / 10.0], -1).float()
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        xr, xb = model(zr, zb, mask, t, b["text_tokens"], b["text_pooled"], b["text_len"], scalars, valid=valid)
+        xr, xb = model(zr, zb, mask, t, b["text_tokens"], b["text_pooled"], b["text_len"], scalars, valid=valid, frame_index=fidx)
     xr, xb = xr.float(), xb.float()
     vr_hat, vr = fl.velocity_pair(xr, root, zr, t, args.v_eps); vb_hat, vb = fl.velocity_pair(xb, body, zb, t, args.v_eps)
     l_root = fl.masked_mse(vr_hat, vr, mask, w_root, valid); l_body = fl.masked_mse(vb_hat, vb, mask, w_body, valid)
@@ -126,7 +136,8 @@ def validate():
 
 def save(path, tag):
     torch.save(dict(model=model.state_dict(), ema=ema, opt=opt.state_dict(), step=step, best_val=best_val, args=vars(args),
-                    stats=dict(root_mean=stats.root_mean, root_std=stats.root_std, body_mean=stats.body_mean, body_std=stats.body_std),
+                    stats=dict(root_mean=stats.root_mean, root_std=stats.root_std, body_mean=stats.body_mean, body_std=stats.body_std,
+                               local_root_mean=stats.local_root_mean, local_root_std=stats.local_root_std),
                     env_constants={k: np.asarray(v) for k, v in env_c.items()}, tag=tag), path)
     log(f"saved {path} ({tag}) at step {step}")
 

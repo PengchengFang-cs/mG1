@@ -2,11 +2,18 @@
 
 Frame convention (from the PHC recorder): row t = (state AFTER step t, action applied AT step t), i.e. the action that
 produced this row's state; the closed-loop buffer (mc_rollout.HistoryBuffer) pushes exactly the same pairing.
-v2 (whole_sequence=True): the future runs to the clip end (capped at F frames, variable length, `valid` mask);
-v1: fixed F-frame future.
-Each sample = window of T = H + F frames from one tracked clip:
+v3 (docs/07 §15): the window is [sparse distant history | dense recent history | future]:
+  * dense history  = the H_dense most recent frames, kept as they are;
+  * sparse history = up to H_sparse frames drawn from the preceding L_max - H_dense frames with SCRIPT's
+    exponential bias towards the recent end (tokens.sample_sparse_history); unused slots are marked invalid;
+  * future         = F frames (or, with whole_sequence, to the clip end, capped at F).
+Tokens are always computed on the CONTIGUOUS span first and the selected rows are gathered afterwards, so
+every row keeps its true instantaneous velocities. Each row carries a signed `frame_index` (0 = first
+generated frame, history negative, true frame offsets) which drives the positional encoding and the gaps
+used by the local-root bridge. The window is canonicalised on the newest history frame (改动 3b).
+Each sample = window of T = H_sparse + H_dense + F rows from one tracked clip:
   root  [T,15], body [T,420]  (normalised tokens, window-canonical frame; see hml_phys.tokens)
-  observed_mask [T]  1 for the H history frames, 0 for the F future frames
+  observed_mask [T]  1 for history rows, 0 for future rows
   text: index into the CLIP cache (-1 = empty / unconditional), progress in [0,1], total_len (seconds)
 Augmentations (all training-time only):
   * start-rest (p_rest): window at clip start, history = 16 copies of frame 0 with zero velocities and the
@@ -67,11 +74,13 @@ class TextCache:
 
 
 class TokenStats:
-    """per-dim mean/std for root and body tokens (MotionCraft-style std = sqrt(var + eps))."""
+    """per-dim mean/std for root, body and local-root features (MotionCraft-style std = sqrt(var + eps))."""
     def __init__(self, path):
         z = np.load(path)
         self.root_mean, self.root_std = z["root_mean"], z["root_std"]
         self.body_mean, self.body_std = z["body_mean"], z["body_std"]
+        self.local_root_mean = z["local_root_mean"] if "local_root_mean" in z else np.zeros(4, np.float32)
+        self.local_root_std = z["local_root_std"] if "local_root_std" in z else np.ones(4, np.float32)
 
     def norm(self, root, body):
         return (root - self.root_mean) / self.root_std, (body - self.body_mean) / self.body_std
@@ -89,10 +98,20 @@ class TokenStats:
 class PhysWindowDataset(Dataset):
     def __init__(self, split, H=16, F=32, stats_path=None, text_cache=None, env_constants=None,
                  p_rest=0.1, p_neutral=0.05, sigma_hist=0.0, stride=1, seed=0, train=True, max_clips=0,
-                 whole_sequence=False, F_min=8):
-        """whole_sequence=True (v2): the future runs from the history end to the clip end, capped at F frames
-        (variable length; padded frames are marked invalid). whole_sequence=False (v1): fixed F-frame future."""
-        self.H, self.F, self.T = H, F, H + F
+                 whole_sequence=False, F_min=8, H_sparse=16, L_max=154, alpha=3.0, randomize_history=True,
+                 p_no_sparse=0.15, alpha_range=(1.0, 5.0)):
+        """H        : dense recent history frames (kept verbatim)
+        H_sparse    : slots for the sparse distant history (0 disables the long history entirely)
+        L_max       : total history span in frames that the sparse part may reach back over
+        alpha       : SCRIPT's exponential bias (0 = uniform, larger = more recent-biased)
+        randomize_history: during training draw H_sparse and alpha per sample so that history length is a
+                    test-time knob; p_no_sparse is the probability of drawing no sparse history at all.
+        whole_sequence=True (v2, kept for reference): future runs to the clip end, capped at F frames."""
+        self.H, self.F = H, F
+        self.H_sparse, self.L_max, self.alpha = H_sparse, L_max, alpha
+        self.randomize_history = bool(randomize_history) and train
+        self.p_no_sparse, self.alpha_range = p_no_sparse, alpha_range
+        self.T = H_sparse + H + F
         self.whole_sequence, self.F_min = whole_sequence, F_min
         self.train = train
         self.p_rest, self.p_neutral, self.sigma_hist = (p_rest, p_neutral, sigma_hist) if train else (0.0, 0.0, 0.0)
@@ -111,13 +130,12 @@ class PhysWindowDataset(Dataset):
             bp = d["body_pos"][i]
             v = np.linalg.norm(np.diff(bp[:min(16, len(bp))], axis=0), axis=-1).mean() * 30 if len(bp) > 1 else 0.0
             self.rest_start.append(bool(v < 0.15 and bp[0, 0, 2] > 0.8))  # near rest AND upright
-            if self.whole_sequence:
-                if T >= self.H + self.F_min:
-                    idx += [(i, s) for s in range(0, T - self.H - self.F_min + 1, stride)]
-            elif T >= self.T:
-                idx += [(i, s) for s in range(0, T - self.T + 1, stride)]
+            need = self.H + (self.F_min if self.whole_sequence else self.F)
+            if T >= need:
+                # s = index of the first DENSE history frame; the sparse part reaches further back when it can
+                idx += [(i, s) for s in range(0, T - need + 1, stride)]
         self.windows = np.array(idx, dtype=np.int64)
-        self.n_clips_short = int(sum(1 for T in d["n_frames"] if T < (self.H + self.F_min if self.whole_sequence else self.T)))
+        self.n_clips_short = int(sum(1 for T in d["n_frames"] if T < (self.H + (self.F_min if self.whole_sequence else self.F))))
         # text candidates per clip: list of (cache_idx, f_sec, t_sec)  (f=t=0 -> untagged)
         self.cands = []
         for texts in d["texts"]:
@@ -136,6 +154,16 @@ class PhysWindowDataset(Dataset):
             return self.F
         return int(min(self.F, int(self.clips["n_frames"][clip]) - (s + self.H)))
 
+    def draw_history_cfg(self, rng):
+        """per-sample (n_sparse, alpha); constant outside training."""
+        if not self.randomize_history:
+            return self.H_sparse, self.alpha
+        if rng.rand() < self.p_no_sparse:
+            return 0, self.alpha
+        n = int(rng.randint(1, self.H_sparse + 1)) if self.H_sparse > 0 else 0
+        a = float(rng.uniform(*self.alpha_range))
+        return n, a
+
     # ---- text
     def pick_text(self, clip, s, rng):
         fps = float(self.clips["fps_eff"][clip])
@@ -145,17 +173,25 @@ class PhysWindowDataset(Dataset):
         return int(cand[rng.randint(len(cand))]) if cand else -1
 
     # ---- raw window with augmentations
-    def raw_window(self, clip, s, mode):
-        """-> raw arrays of length H + F_used (F_used = future_len; variable in whole-sequence mode)."""
+    def raw_window(self, clip, s, mode, n_sparse, alpha, rng):
+        """Assemble one window.
+
+        Returns (bp, ds, rs, ac, frame_index, n_hist, n_used) where the arrays are the CONTIGUOUS span that
+        the tokens must be computed on, `frame_index` are the signed offsets of the rows to gather out of
+        that span (0 = first generated frame), `n_hist` the number of history rows and `n_used` the number
+        of valid rows. Rows are gathered by the caller after tokenisation, so every row keeps its true
+        instantaneous velocities.
+
+        s = index of the first DENSE history frame. The sparse part reaches back over the preceding
+        min(L_max - H, s) frames; in the rest/neutral modes the history is synthetic and there is no
+        sparse part (the clip has not started yet).
+        """
         c = self.clips
-        Fu = self.future_len(clip, s) if mode == "normal" else min(self.F, int(c["n_frames"][clip]))
-        Tw = self.H + Fu
-        bp, ds, rs, ac = (c["body_pos"][clip][s:s + Tw].copy(), c["dof_state"][clip][s:s + Tw].copy(),
-                          c["root_state"][clip][s:s + Tw].copy(), c["action"][clip][s:s + Tw].copy())
         if mode in ("rest", "neutral"):
-            # history = 16 static frames, future = clip frames [0:Fu)  (s == 0 by construction)
+            Fu = min(self.F, int(c["n_frames"][clip]))
             fut = slice(0, Fu)
-            bp_f, ds_f, rs_f, ac_f = c["body_pos"][clip][fut], c["dof_state"][clip][fut], c["root_state"][clip][fut], c["action"][clip][fut]
+            bp_f, ds_f, rs_f, ac_f = (c["body_pos"][clip][fut], c["dof_state"][clip][fut],
+                                      c["root_state"][clip][fut], c["action"][clip][fut])
             if mode == "rest":
                 bp0, dof0, rs0 = bp_f[0], ds_f[0, :, 0], rs_f[0].copy()
             else:
@@ -165,15 +201,32 @@ class PhysWindowDataset(Dataset):
                 yaw_n = _hip_yaw(bp0); yaw_c = _hip_yaw(bp_f[0])
                 bp_f, rs_f = _rotate_z(bp_f, rs_f, yaw_n - yaw_c, center=bp_f[0, 0, :2])
                 shift = bp_f[0, 0, :2] - bp0[0, :2]
-                bp0[:, :2] += shift; rs0[:2] += shift
-            rs0[7:13] = 0.0
+                bp0 = bp0.copy(); bp0[:, :2] += shift; rs0[:2] += shift
+            rs0 = rs0.copy(); rs0[7:13] = 0.0
             hold = tk.hold_action(dof0, self.env["pd_offset"], self.env["pd_scale"]).astype(np.float32)
             bp = np.concatenate([np.repeat(bp0[None], self.H, 0), bp_f], 0)
             ds_h = np.zeros((self.H,) + ds_f.shape[1:], ds_f.dtype); ds_h[:, :, 0] = dof0
             ds = np.concatenate([ds_h, ds_f], 0)
             rs = np.concatenate([np.repeat(rs0[None], self.H, 0), rs_f], 0)
             ac = np.concatenate([np.repeat(hold[None], self.H, 0), ac_f], 0)
-        return bp, ds, rs, ac
+            rows = np.arange(self.H + Fu)
+            frame_index = rows - self.H
+            return bp, ds, rs, ac, rows, frame_index, self.H, self.H + Fu
+
+        Fu = self.future_len(clip, s)
+        l_distant = int(min(self.L_max - self.H, s))          # frames available before the dense history
+        span0 = s - l_distant                                  # first frame of the contiguous span
+        span1 = s + self.H + Fu                                # one past the last
+        bp = c["body_pos"][clip][span0:span1]
+        ds = c["dof_state"][clip][span0:span1]
+        rs = c["root_state"][clip][span0:span1]
+        ac = c["action"][clip][span0:span1]
+        sparse = tk.sample_sparse_history(l_distant, n_sparse, alpha, rng)   # indices into [span0, s)
+        dense = np.arange(l_distant, l_distant + self.H)
+        future = np.arange(l_distant + self.H, l_distant + self.H + Fu)
+        rows = np.concatenate([sparse, dense, future]).astype(np.int64)
+        frame_index = rows - (l_distant + self.H)              # 0 = first generated frame, history negative
+        return bp, ds, rs, ac, rows, frame_index, len(sparse) + self.H, len(rows)
 
     def __getitem__(self, i):
         clip, s = map(int, self.windows[i])
@@ -186,40 +239,57 @@ class PhysWindowDataset(Dataset):
                     mode, s = "neutral", 0
             elif u < self.p_neutral + self.p_rest:
                 mode, s = "rest", 0
-        bp, ds, rs, ac = self.raw_window(clip, s, mode)
-        root, body = tk.window_tokens(bp, ds, rs, ac)
+        n_sparse, alpha = self.draw_history_cfg(rng)
+        bp, ds, rs, ac, rows, frame_index, n_hist, n_used = self.raw_window(clip, s, mode, n_sparse, alpha, rng)
+        # tokens on the contiguous span (true instantaneous velocities), canonicalised on the newest history
+        # frame (改动 3b), then gather the selected rows
+        origin = int(rows[n_hist - 1])
+        root_full, body_full = tk.window_tokens(bp, ds, rs, ac, origin=origin)
+        root, body = root_full[rows], body_full[rows]
         if self.stats is not None:
             root, body = self.stats.norm(root, body)
         if self.sigma_hist > 0:
-            root[:self.H] += rng.randn(self.H, root.shape[1]).astype(np.float32) * self.sigma_hist
-            body[:self.H] += rng.randn(self.H, body.shape[1]).astype(np.float32) * self.sigma_hist
-        Tw = root.shape[0]
-        valid = np.zeros(self.T, np.float32); valid[:Tw] = 1.0
-        if Tw < self.T:  # pad (whole-sequence mode); padded frames are invalid
-            root = np.concatenate([root, np.zeros((self.T - Tw, root.shape[1]), np.float32)], 0)
-            body = np.concatenate([body, np.zeros((self.T - Tw, body.shape[1]), np.float32)], 0)
+            root[:n_hist] += rng.randn(n_hist, root.shape[1]).astype(np.float32) * self.sigma_hist
+            body[:n_hist] += rng.randn(n_hist, body.shape[1]).astype(np.float32) * self.sigma_hist
+        # pad to the fixed layout [H_sparse | H | F]; unused sparse slots are invalid and masked out
+        pad = self.T - n_used
+        fidx = np.asarray(frame_index, np.int64)
+        valid = np.ones(n_used, np.float32)
+        mask = np.zeros(n_used, np.float32); mask[:n_hist] = 1.0
+        if pad > 0:
+            z = np.zeros((pad, root.shape[1]), np.float32); root = np.concatenate([z, root], 0)
+            z = np.zeros((pad, body.shape[1]), np.float32); body = np.concatenate([z, body], 0)
+            valid = np.concatenate([np.zeros(pad, np.float32), valid], 0)
+            mask = np.concatenate([np.ones(pad, np.float32), mask], 0)      # padded rows count as observed
+            fidx = np.concatenate([np.full(pad, fidx[0], np.int64), fidx], 0)
         T_clip = int(self.clips["n_frames"][clip]); fps = float(self.clips["fps_eff"][clip])
-        now = (0 if mode != "normal" else s) + (0 if mode != "normal" else self.H)  # frames of the clip already executed
+        now = 0 if mode != "normal" else s + self.H     # clip frames already executed at the replan point
         progress = now / max(1, T_clip)
         total_len = T_clip / fps
         ti = self.pick_text(clip, s if mode == "normal" else -self.H, rng)  # augmented: future = clip frames [0:F)
-        mask = np.zeros(self.T, np.float32); mask[:self.H] = 1.0
         return dict(root=torch.from_numpy(root.astype(np.float32)), body=torch.from_numpy(body.astype(np.float32)),
-                    observed_mask=torch.from_numpy(mask), valid=torch.from_numpy(valid), text_idx=ti, progress=np.float32(progress),
-                    total_len=np.float32(total_len), clip=clip, start=s, mode=mode, n_frames=Tw)
+                    observed_mask=torch.from_numpy(mask), valid=torch.from_numpy(valid),
+                    frame_index=torch.from_numpy(fidx), text_idx=ti, progress=np.float32(progress),
+                    total_len=np.float32(total_len), clip=clip, start=s, mode=mode, n_frames=n_used,
+                    n_hist=pad + n_hist,                       # index of the first future row in the PADDED layout
+                    n_sparse=int(n_hist - self.H))             # real sparse rows (excludes the padded slots)
 
 
 def collate(batch, text_cache):
-    out = {k: torch.stack([b[k] for b in batch]) for k in ["root", "body", "observed_mask", "valid"]}
-    Tmax = int(max(b["n_frames"] for b in batch))  # trim padding to the longest window in the batch
-    for k in ["root", "body", "observed_mask", "valid"]:
-        out[k] = out[k][:, :Tmax].contiguous()
+    keys = ["root", "body", "observed_mask", "valid", "frame_index"]
+    out = {k: torch.stack([b[k] for b in batch]) for k in keys}
+    Tmax = int(max(b["n_frames"] for b in batch))  # padding sits at the FRONT, so trim from the left
+    T = out["root"].shape[1]
+    if Tmax < T:
+        for k in keys:
+            out[k] = out[k][:, T - Tmax:].contiguous()
     empty = text_cache.index.get("", -1)  # windows without caption use the CLIP("") features (same as dropout / CFG)
     toks, pooled, lens = zip(*[text_cache.get(b["text_idx"] if b["text_idx"] >= 0 else empty) for b in batch])
     out["text_tokens"] = torch.from_numpy(np.stack(toks)); out["text_pooled"] = torch.from_numpy(np.stack(pooled))
     out["text_len"] = torch.tensor(lens); out["text_dropped"] = torch.tensor([b["text_idx"] < 0 for b in batch])
     out["progress"] = torch.tensor([b["progress"] for b in batch]); out["total_len"] = torch.tensor([b["total_len"] for b in batch])
     out["mode"] = [b["mode"] for b in batch]
+    out["n_sparse"] = torch.tensor([b["n_sparse"] for b in batch])
     return out
 
 

@@ -56,12 +56,18 @@ def _qbetween(v0, v1):
 
 
 # ----------------------------------------------------------------------------- canonicalisation (window frame 0)
-def canonicalize(body_pos, root_state):
-    """UniPhys cano_seq_smpl_or_smplx for one window. Returns (cano_body_pos [T,24,3], cano_root_state [T,13], transf [4,4])."""
+def canonicalize(body_pos, root_state, origin=0):
+    """UniPhys cano_seq_smpl_or_smplx for one window, with a selectable origin frame.
+
+    origin = index of the frame whose root xy goes to the world origin and whose hip-across direction is
+    rotated onto +y (v1/v2 used the oldest window frame, 0; v3 uses the newest history frame, N_s - 1, so
+    that the frames being predicted sit closest to the origin — see docs/07 §15 改动 3b).
+    Returns (cano_body_pos [T,24,3], cano_root_state [T,13], transf [4,4]).
+    """
     p = body_pos.astype(np.float64).copy()
-    root_xy0 = p[0, 0] * np.array([1.0, 1.0, 0.0])
+    root_xy0 = p[origin, 0] * np.array([1.0, 1.0, 0.0])
     p = p - root_xy0
-    across = p[0, R_HIP] - p[0, L_HIP]
+    across = p[origin, R_HIP] - p[origin, L_HIP]
     x_axis = across.copy(); x_axis[-1] = 0.0
     x_axis = x_axis / np.linalg.norm(x_axis)
     z_axis = np.array([0.0, 0.0, 1.0])
@@ -74,7 +80,8 @@ def canonicalize(body_pos, root_state):
     rs = root_state.astype(np.float64)
     T = len(rs)
     root_pos = rs[:, :3]; root_rotm = R.from_quat(rs[:, 3:7]).as_matrix()
-    body_mat = np.zeros((T, 4, 4)); body_mat[:, :3, :3] = root_rotm; body_mat[:, :3, 3] = root_pos + (body_pos[0, 0] - root_pos[0]); body_mat[:, 3, 3] = 1
+    body_mat = np.zeros((T, 4, 4)); body_mat[:, :3, :3] = root_rotm
+    body_mat[:, :3, 3] = root_pos + (body_pos[origin, 0] - root_pos[origin]); body_mat[:, 3, 3] = 1
     new = transf[None] @ body_mat
     quat_new = R.from_matrix(new[:, :3, :3]).as_quat()
     pos_new = new[:, :3, 3]
@@ -122,9 +129,9 @@ def get_repr(cano_body_pos, dof_state, cano_root_state):
                 dof_vel=dof_state[..., 1].reshape(T, -1).astype(np.float64), heading_quat=q)
 
 
-def window_tokens(body_pos, dof_state, root_state, action):
+def window_tokens(body_pos, dof_state, root_state, action, origin=0):
     """One window [T frames] of raw physics -> (root [T,15], body [T,420]) float32 in the window-canonical frame."""
-    cp, crs, _ = canonicalize(body_pos, root_state)
+    cp, crs, _ = canonicalize(body_pos, root_state, origin=origin)
     r = get_repr(cp, dof_state, crs)
     root = np.concatenate([r["root_trans"], r["root_rot_6d"], r["root_trans_vel"], r["root_rot_vel"]], -1)
     body = np.concatenate([r["local_positions"], r["local_vel"], r["dof_pose_6d"], r["dof_vel"], action.astype(np.float64)], -1)
@@ -155,12 +162,12 @@ def check_against_uniphys(body_pos, dof_state, root_state, atol=1e-4):
 
 
 # ----------------------------------------------------------------------------- batched version (closed loop, B windows)
-def canonicalize_batch(body_pos, root_state):
+def canonicalize_batch(body_pos, root_state, origin=0):
     """body_pos [B,T,24,3], root_state [B,T,13] -> cano body_pos, cano root_state (same math as canonicalize)."""
     p = body_pos.astype(np.float64).copy(); B, T = p.shape[:2]
-    root_xy0 = p[:, 0, 0] * np.array([1.0, 1.0, 0.0])
+    root_xy0 = p[:, origin, 0] * np.array([1.0, 1.0, 0.0])
     p = p - root_xy0[:, None, None]
-    across = p[:, 0, R_HIP] - p[:, 0, L_HIP]
+    across = p[:, origin, R_HIP] - p[:, origin, L_HIP]
     x_axis = across.copy(); x_axis[:, -1] = 0.0
     x_axis = x_axis / np.linalg.norm(x_axis, axis=-1, keepdims=True)
     z_axis = np.tile(np.array([0.0, 0.0, 1.0]), (B, 1))
@@ -172,7 +179,7 @@ def canonicalize_batch(body_pos, root_state):
     rs = root_state.astype(np.float64)
     root_rotm = R.from_quat(rs[:, :, 3:7].reshape(-1, 4)).as_matrix().reshape(B, T, 3, 3)
     body_mat = np.zeros((B, T, 4, 4)); body_mat[..., :3, :3] = root_rotm
-    body_mat[..., :3, 3] = rs[:, :, :3] + (body_pos[:, 0, 0] - rs[:, 0, :3])[:, None]; body_mat[..., 3, 3] = 1
+    body_mat[..., :3, 3] = rs[:, :, :3] + (body_pos[:, origin, 0] - rs[:, origin, :3])[:, None]; body_mat[..., 3, 3] = 1
     new = np.einsum("bij,btjk->btik", transf, body_mat)
     quat_new = R.from_matrix(new[..., :3, :3].reshape(-1, 3, 3)).as_quat().reshape(B, T, 4)
     pos_new = new[..., :3, 3]
@@ -181,10 +188,10 @@ def canonicalize_batch(body_pos, root_state):
     return p, np.concatenate([pos_new, quat_new, vel_new, angvel_new], -1)
 
 
-def window_tokens_batch(body_pos, dof_state, root_state, action):
+def window_tokens_batch(body_pos, dof_state, root_state, action, origin=0):
     """[B,T,...] raw physics -> (root [B,T,15], body [B,T,420]) float32; same result as window_tokens per window."""
     B, T = body_pos.shape[:2]
-    cp, crs = canonicalize_batch(body_pos, root_state)
+    cp, crs = canonicalize_batch(body_pos, root_state, origin=origin)
     roots, bodies = [], []
     # per-frame heading + local positions are cheap; do per window to keep the reference implementation exact
     for b in range(B):
@@ -192,3 +199,82 @@ def window_tokens_batch(body_pos, dof_state, root_state, action):
         roots.append(np.concatenate([r["root_trans"], r["root_rot_6d"], r["root_trans_vel"], r["root_rot_vel"]], -1))
         bodies.append(np.concatenate([r["local_positions"], r["local_vel"], r["dof_pose_6d"], r["dof_vel"], action[b].astype(np.float64)], -1))
     return np.stack(roots).astype(np.float32), np.stack(bodies).astype(np.float32)
+
+
+
+# ============================================================================================
+# Local (velocity) root — the KiMoDo / ARDY / MotionCraft root->body bridge (docs/07 §15 改动 1)
+# 4 dims: [yaw rate, dx * fps, dy * fps, root height], computed from the 15-d root token by finite
+# differences; the last valid frame copies its predecessor. Our frame is z-up, so the horizontal
+# plane is xy and the height is z (KiMoDo is y-up and uses xz + y).
+# ============================================================================================
+LOCAL_ROOT_DIM = 4
+FPS = 30.0
+
+
+def _heading_from_rot6d(rot6d):
+    """[..., 6] first two columns of the rotation matrix -> unit horizontal heading [..., 2] (the body x axis)."""
+    x_axis = rot6d[..., 0:3]
+    h = x_axis[..., :2]
+    n = np.linalg.norm(h, axis=-1, keepdims=True)
+    return h / np.clip(n, 1e-8, None)
+
+
+def root_to_local_root(root, fps=FPS, valid=None, frame_index=None):
+    """root [T,15] (un-normalised) -> local root [T,4] = [yaw rate, dx/dt, dy/dt, z].
+
+    frame_index: optional [T] true frame offsets. Rows of a window may be non-contiguous in time (the
+    sparse long history), so the finite differences are divided by the actual gap dt in frames; with
+    contiguous rows dt = 1 and this reduces to the KiMoDo formula (multiply by fps).
+    valid: optional [T] bool; the last valid row has no successor and copies its predecessor, exactly as
+    KimodoRootConditioner does (hy273_root_conditioning.py:94-99).
+    """
+    root = np.asarray(root, dtype=np.float64)
+    T = root.shape[0]
+    a, b = ROOT_SLICES["root_trans"]; pos = root[:, a:b]
+    a, b = ROOT_SLICES["root_rot_6d"]; head = _heading_from_rot6d(root[:, a:b])
+    out = np.zeros((T, LOCAL_ROOT_DIM), np.float64)
+    if T >= 2:
+        if frame_index is None:
+            dt = np.ones(T - 1)
+        else:
+            dt = np.maximum(np.diff(np.asarray(frame_index, dtype=np.float64)), 1.0)
+        cross = head[:-1, 0] * head[1:, 1] - head[:-1, 1] * head[1:, 0]
+        dot = (head[:-1] * head[1:]).sum(-1)
+        out[:-1, 0] = np.arctan2(cross, dot) * fps / dt
+        out[:-1, 1:3] = (pos[1:, :2] - pos[:-1, :2]) * fps / dt[:, None]
+    out[:, 3] = pos[:, 2]
+    n_valid = int(valid.sum()) if valid is not None else T
+    if n_valid >= 2:  # last valid row has no successor: copy the previous row's velocity channels
+        out[n_valid - 1, :3] = out[n_valid - 2, :3]
+    elif T >= 1:
+        out[0, :3] = 0.0
+    return out
+
+
+# ----------------------------------------------------------------------------- sparse long history (SCRIPT eq. 6)
+def sample_sparse_history(l_distant, n_sparse, alpha, rng):
+    """SCRIPT's non-linear history downsampling: indices into a distant span of length `l_distant`,
+    biased towards the recent end (index l_distant-1 is the most recent distant frame).
+
+        I_i = floor( L_distant * (1 + ln(1 - u_i (1 - e^-alpha)) / alpha) ),   u_i ~ U[0,1]
+
+    alpha -> 0 degenerates to uniform sampling. Returns a sorted array of at most `n_sparse` distinct
+    indices (duplicates are dropped and the shortfall is filled from the most recent unused frames).
+    """
+    if l_distant <= 0 or n_sparse <= 0:
+        return np.zeros(0, dtype=np.int64)
+    if l_distant <= n_sparse:
+        return np.arange(l_distant, dtype=np.int64)
+    u = rng.rand(n_sparse)
+    if alpha <= 1e-6:
+        idx = np.floor(l_distant * (1.0 - u))
+    else:
+        idx = np.floor(l_distant * (1.0 + np.log(1.0 - u * (1.0 - np.exp(-alpha))) / alpha))
+    idx = np.clip(idx, 0, l_distant - 1).astype(np.int64)
+    idx = np.unique(idx)
+    if len(idx) < n_sparse:  # fill the shortfall with the most recent frames not yet taken
+        taken = np.zeros(l_distant, bool); taken[idx] = True
+        spare = np.where(~taken)[0][::-1][: n_sparse - len(idx)]
+        idx = np.union1d(idx, spare)
+    return idx.astype(np.int64)

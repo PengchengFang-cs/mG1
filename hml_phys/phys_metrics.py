@@ -81,3 +81,67 @@ def all_metrics(joints_list):
         "jerk_m_s3": j_ms3,
         "jerk_mm_frame3": j_mmf3,
     }
+
+
+# ============================================================================================
+# Paper-aligned metrics on RAW simulator output (SCRIPT Appendix D / PhysDiff / CLoSD)
+# Input: arrays [T, 24, 3] of Isaac/MuJoCo-order body positions, z up, metres, at the control
+# rate (30 Hz here). No resampling, no 22-joint reduction, no re-flooring: the simulator's
+# ground plane is z = 0, which is what the papers measure against.
+#   Floating   = mean_t max(min_j z - 0.005, 0) * 1000            [mm]
+#   Penetration= mean_t max(0.005 - min_j z, 0) * 1000            [mm]
+#   Skating    = mean horizontal displacement of ground-contacting feet between adjacent frames [mm]
+#   Jerk       = mean_{t,j} || p_{t+3} - 3 p_{t+2} + 3 p_{t+1} - p_t ||_2 * 1000   [mm/frame^3]
+#              (third finite difference WITHOUT the dt^3 factor; cubically dependent on the frame
+#               rate, so the rate must always be quoted with the number)
+#   Duration   = sum_n T_valid^(n) / sum_n T_ref^(n)  (frame-weighted over the whole test set)
+# Verified against the published physics ground truth: ours 2.29 mm/frame^3 @30 Hz vs SCRIPT 2.941
+# and MIND 2.7172 (their table is in metres under a mm header; multiply MIND's numbers by 1000).
+# ============================================================================================
+SIM_FPS = 30.0
+SIM_FEET = [4, 8]        # L_Toe, R_Toe in MuJoCo body order
+SIM_ANKLES = [3, 7]      # L_Ankle, R_Ankle
+FALL_ROOT_Z = 0.15       # PHC default termination height, used by SCRIPT for Duration
+
+
+def floating_mm_raw(pos_list, tol=TOL):
+    v = [np.clip(p[:, :, 2].min(axis=1) - tol, 0, None) * 1000.0 for p in pos_list]
+    return float(np.mean(np.concatenate(v)))
+
+
+def penetration_mm_raw(pos_list, tol=TOL):
+    v = [np.clip(tol - p[:, :, 2].min(axis=1), 0, None) * 1000.0 for p in pos_list]
+    return float(np.mean(np.concatenate(v)))
+
+
+def skating_mm_raw(pos_list, contact_h=0.05):
+    """PhysDiff/CLoSD skating on raw sim: horizontal displacement of foot bodies that stay in contact."""
+    vals = []
+    for p in pos_list:
+        f = p[:, SIM_FEET + SIM_ANKLES]
+        h = f[:, :, 2]
+        contact = (h[:-1] < contact_h) & (h[1:] < contact_h)
+        disp = np.linalg.norm(f[1:, :, :2] - f[:-1, :, :2], axis=-1) * 1000.0
+        if contact.any():
+            vals.append(disp[contact])
+    return float(np.mean(np.concatenate(vals))) if vals else 0.0
+
+
+def jerk_mm_frame3_raw(pos_list):
+    v = []
+    for p in pos_list:
+        if len(p) < 4:
+            continue
+        d3 = p[3:] - 3 * p[2:-1] + 3 * p[1:-2] - p[:-3]
+        v.append(np.linalg.norm(d3, axis=-1).mean(1))
+    return float(np.mean(np.concatenate(v)) * 1000.0) if v else float("nan")
+
+
+def duration_frame_weighted(valid_frames, ref_frames):
+    """SCRIPT: sum of simulated frames before termination / sum of reference frames, over all rollouts."""
+    return float(np.sum(valid_frames) / max(1.0, np.sum(ref_frames)))
+
+
+def all_metrics_raw(pos_list):
+    return dict(floating_mm=floating_mm_raw(pos_list), penetration_mm=penetration_mm_raw(pos_list),
+                skating_mm=skating_mm_raw(pos_list), jerk_mm_frame3=jerk_mm_frame3_raw(pos_list), fps=SIM_FPS)
