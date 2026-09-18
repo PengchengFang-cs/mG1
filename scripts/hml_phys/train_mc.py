@@ -23,7 +23,7 @@ ap.add_argument("--H_sparse", type=int, default=16, help="v3: sparse distant his
 ap.add_argument("--L_max", type=int, default=154, help="v3: history span in frames the sparse part reaches back over")
 ap.add_argument("--alpha", type=float, default=3.0, help="v3: SCRIPT exponential bias (0 = uniform)")
 ap.add_argument("--no_randomize_history", action="store_true", help="keep H_sparse/alpha fixed instead of drawing them per sample")
-ap.add_argument("--p_no_sparse", type=float, default=0.15); ap.add_argument("--alpha_min", type=float, default=1.0); ap.add_argument("--alpha_max", type=float, default=5.0)
+ap.add_argument("--p_no_sparse", type=float, default=0.15); ap.add_argument("--alpha_min", type=float, default=0.0); ap.add_argument("--alpha_max", type=float, default=5.0)
 ap.add_argument("--local_root", type=int, default=1, help="1: body stage sees the 4-d local root (KiMoDo/ARDY); 0: raw root token")
 ap.add_argument("--hidden", type=int, default=512); ap.add_argument("--heads", type=int, default=8)
 ap.add_argument("--root_depth", default="2,4"); ap.add_argument("--body_depth", default="3,6")

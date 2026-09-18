@@ -99,7 +99,7 @@ class PhysWindowDataset(Dataset):
     def __init__(self, split, H=16, F=32, stats_path=None, text_cache=None, env_constants=None,
                  p_rest=0.1, p_neutral=0.05, sigma_hist=0.0, stride=1, seed=0, train=True, max_clips=0,
                  whole_sequence=False, F_min=8, H_sparse=16, L_max=154, alpha=3.0, randomize_history=True,
-                 p_no_sparse=0.15, alpha_range=(1.0, 5.0)):
+                 p_no_sparse=0.15, alpha_range=(0.0, 5.0)):
         """H        : dense recent history frames (kept verbatim)
         H_sparse    : slots for the sparse distant history (0 disables the long history entirely)
         L_max       : total history span in frames that the sparse part may reach back over
