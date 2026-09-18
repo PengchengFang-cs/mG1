@@ -52,7 +52,8 @@ class HistoryBuffer:
         self.n = min(self.n + 1, self.L)
 
 
-def run_rollouts_mc(experiment, items, out_path, ckpt, save_every=1, seed=0, K=4, num_steps=32, cfg_scale=3.5, weights="ema"):
+def run_rollouts_mc(experiment, items, out_path, ckpt, save_every=1, seed=0, K=4, num_steps=32, cfg_scale=3.5,
+                    weights="ema", h_sparse_override=None, alpha_override=None, l_max_override=None):
     exp = experiment; player = exp.player; env = player.env; task = env.task
     dev = torch.device("cuda")
     # the imitation env would otherwise terminate episodes that drift >0.25 m from its hidden reference motion
@@ -65,8 +66,15 @@ def run_rollouts_mc(experiment, items, out_path, ckpt, save_every=1, seed=0, K=4
         print(f"WARNING: env state init is {task._state_init}, protocol expects StateInit.Start (fixed standing pose)")
     H, F = int(margs["H"]), int(margs["F"]); T = H + F
     whole = bool(margs.get("whole_sequence", False))  # v2: future = remaining frames of the episode (capped at F)
+    is_v3 = "H_sparse" in margs      # checkpoints trained before v3 used absolute positions and no sparse history
     H_sparse = int(margs.get("H_sparse", 0)); L_max = int(margs.get("L_max", H)); alpha = float(margs.get("alpha", 3.0))
-    L_max = max(L_max, H)
+    if h_sparse_override is not None:   # test-time history knob (docs/07 §15 改动 3)
+        H_sparse = int(h_sparse_override)
+    if alpha_override is not None:
+        alpha = float(alpha_override)
+    if l_max_override is not None:
+        L_max = int(l_max_override)
+    L_max = max(L_max, H + H_sparse)
     rng_np = np.random.RandomState(seed)
     clip_enc = ClipText()
     empty_tok, empty_pool, empty_len = clip_enc.encode([""])
@@ -75,7 +83,8 @@ def run_rollouts_mc(experiment, items, out_path, ckpt, save_every=1, seed=0, K=4
     gen = torch.Generator(device=dev); gen.manual_seed(seed); np.random.seed(seed)
     print(f"MC policy rollout: ckpt step {ckpt_step} ({weights}), {len(items)} items, {num_envs} envs, "
           f"window [{H_sparse} sparse | {H} dense | {F} future] over L_max {L_max}, alpha {alpha}, K={K}, "
-          f"Euler {num_steps}, cfg {cfg_scale}, local_root={model.local_root}, stateInit={task._state_init}")
+          f"Euler {num_steps}, cfg {cfg_scale}, local_root={model.local_root}, "
+          f"positions={'signed (v3)' if is_v3 else 'absolute (v1/v2 compat)'}, stateInit={task._state_init}")
     episodes, neutral_state = [], None
     if os.path.exists(out_path):
         episodes = joblib.load(out_path)["episodes"]
@@ -143,7 +152,10 @@ def run_rollouts_mc(experiment, items, out_path, ckpt, save_every=1, seed=0, K=4
             xr[:, n_hist:] = 0; xb[:, n_hist:] = 0
             mask = torch.zeros(num_envs, Tb, device=dev); mask[:, :n_hist] = 1.0
             valid = (torch.arange(Tb, device=dev)[None] < (n_hist + torch.from_numpy(fut).to(dev))[:, None]).float()
-            frame_index = torch.from_numpy(fidx).to(dev).long()[None].expand(num_envs, Tb).contiguous()
+            if is_v3:
+                frame_index = torch.from_numpy(fidx).to(dev).long()[None].expand(num_envs, Tb).contiguous()
+            else:   # v1/v2 were trained with pos = arange(T); keep their exact text<->motion offsets
+                frame_index = torch.arange(Tb, device=dev).long()[None].expand(num_envs, Tb).contiguous()
             progress = np.clip(episode_length / np.maximum(1.0, total_len * 30.0), 0, 1)
             scal = torch.from_numpy(np.stack([progress, total_len / 10.0], -1)).float().to(dev)
             with torch.autocast("cuda", dtype=torch.bfloat16):

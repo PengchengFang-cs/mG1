@@ -22,15 +22,20 @@ ap.add_argument("--out", default=os.path.join(ROOT, "token_stats_v3.npz"))
 ap.add_argument("--eps", type=float, default=1e-5)
 args = ap.parse_args()
 
-ds = PhysWindowDataset("train", H=args.H, F=args.F, train=False, whole_sequence=args.whole_sequence,
-                       H_sparse=args.H_sparse, L_max=args.L_max, alpha=args.alpha, randomize_history=False)
+# train=True so that draw_history_cfg follows the same law the model is trained under (n_sparse and alpha
+# are drawn per sample); otherwise the statistics are fitted on a distribution training never sees.
+ds = PhysWindowDataset("train", H=args.H, F=args.F, train=True, whole_sequence=args.whole_sequence,
+                       H_sparse=args.H_sparse, L_max=args.L_max, alpha=args.alpha, randomize_history=True)
 rng = np.random.RandomState(0)
 sel = rng.choice(len(ds), min(args.n, len(ds)), replace=False)
 roots, bodies, locals_ = [], [], []
+n_sparse_hist = []
 for j, i in enumerate(sel):
     clip, s = map(int, ds.windows[i])
     wrng = np.random.RandomState(int(i))
-    bp, dof, rs, ac, rows, fidx, n_hist, n_used = ds.raw_window(clip, s, "normal", args.H_sparse, args.alpha, wrng)
+    n_sp, al = ds.draw_history_cfg(wrng)
+    n_sparse_hist.append(n_sp)
+    bp, dof, rs, ac, rows, fidx, n_hist, n_used = ds.raw_window(clip, s, "normal", n_sp, al, wrng)
     origin = int(rows[n_hist - 1])
     r_full, b_full = tk.window_tokens(bp, dof, rs, ac, origin=origin)
     r, b = r_full[rows], b_full[rows]
@@ -43,7 +48,8 @@ lr = np.concatenate(locals_, 0).astype(np.float64)
 st["local_root_mean"] = lr.mean(0).astype(np.float32)
 st["local_root_std"] = np.sqrt(lr.var(0) + args.eps).astype(np.float32)
 np.savez(args.out, **st)
-print("saved", args.out, "| windows total", len(ds), "| short clips skipped", ds.n_clips_short)
+print("saved", args.out, "| windows total", len(ds), "| short clips skipped", ds.n_clips_short,
+      "| mean n_sparse %.1f" % np.mean(n_sparse_hist))
 print("root std ", np.round(st["root_std"], 3))
 print("local root mean", np.round(st["local_root_mean"], 3), "std", np.round(st["local_root_std"], 3))
 print("body std range", st["body_std"].min(), st["body_std"].max())

@@ -28,7 +28,10 @@ for p in args.rollouts:
     ok = [x["body_pos"] for x in keep if not x["fell"]]
     allp = [x["body_pos"] for x in keep]
     valid = np.array([len(x["body_pos"]) for x in e], float)
-    ref = np.array([x["target_frames"] for x in e], float)
+    # SCRIPT's T_ref is the reference motion length (GT frames at 20 fps -> 30 fps sim), not our rollout
+    # target, which carries a small execution margin on top of it
+    ref = np.array([np.ceil(x["gt_length"] * 1.5) if x.get("gt_length", -1) > 0 else x["target_frames"] for x in e], float)
+    valid = np.minimum(valid, ref)
     name = os.path.basename(p).replace("rollouts_", "").replace(".pkl", "")
     out[name] = dict(non_fallen=pm.all_metrics_raw(ok), all_episodes=pm.all_metrics_raw(allp),
                      duration=pm.duration_frame_weighted(valid, ref),

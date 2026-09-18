@@ -91,13 +91,18 @@ def canonicalize(body_pos, root_state, origin=0):
 
 
 # ----------------------------------------------------------------------------- representation (UniPhys get_repr, return_last=True)
-def heading_quat(body_pos):
+def heading_quat(body_pos, origin=0):
     """per-frame quaternion (w,x,y,z) rotating the hip-derived forward direction onto +y.
 
     NOTE: UniPhys get_repr unpacks face_joint_indx_robot=[5,1] as (l_hip, r_hip), i.e. the opposite order
-    of the canonicalisation step, so its per-frame local frame faces -y (a consistent 180-degree yaw for
-    every frame, frame 0 forced to (0,0,0,1)). We reproduce that convention exactly so the two
-    implementations agree numerically; it is self-consistent and harmless.
+    of the canonicalisation step, so its per-frame local frame faces -y. We reproduce that convention
+    exactly so the two implementations agree numerically; it is self-consistent and harmless.
+
+    The CANONICALISATION frame is the degenerate case: there the hip-across direction is exactly +x, so
+    forward is exactly -y and qbetween(-y, +y) has both a zero axis and a zero scalar part. UniPhys hard-
+    codes it to (0,0,0,1) -- which is a 180-degree yaw about z, NOT the identity -- and that is the correct
+    limit. Since v3 canonicalises on the newest history frame, the override must be applied at `origin`,
+    not at row 0 (applying it at row 0 would impose the origin's heading on an unrelated frame).
     """
     across = body_pos[:, L_HIP] - body_pos[:, R_HIP]
     across = across.copy(); across[:, -1] = 0
@@ -105,17 +110,17 @@ def heading_quat(body_pos):
     forward = np.cross(np.array([[0, 0, 1.0]]), across)
     forward = forward / np.sqrt((forward ** 2).sum(-1))[..., None]
     q = _qbetween(forward, np.tile(np.array([[0, 1.0, 0]]), (len(forward), 1)))
-    q[0] = np.array([0, 0, 0, 1.0])  # UniPhys sets frame 0 to (0,0,0,1) after canonicalisation (identity in their storage)
+    q[origin] = np.array([0, 0, 0, 1.0])  # exact limit at the canonicalisation frame (180-degree yaw about z)
     bad = np.isnan(q).any(-1)
     for i in np.where(bad)[0]:
-        q[i] = q[i - 1]
+        q[i] = q[i - 1] if i > 0 else np.array([0, 0, 0, 1.0])
     return q
 
 
-def get_repr(cano_body_pos, dof_state, cano_root_state):
+def get_repr(cano_body_pos, dof_state, cano_root_state, origin=0):
     """Returns dict of per-frame arrays (T frames each), float32 — mirrors UniPhys get_repr(return_last=True)."""
     p = cano_body_pos.astype(np.float64); T, J, _ = p.shape
-    q = heading_quat(p)
+    q = heading_quat(p, origin=origin)
     local = p.copy(); local[..., 0] -= local[:, :1, 0]; local[..., 1] -= local[:, :1, 1]
     local = _qrot(np.repeat(q[:, None], J, 1), local)
     lvel = _qrot(np.repeat(q[:-1, None], J, 1), p[1:] - p[:-1])
@@ -132,7 +137,7 @@ def get_repr(cano_body_pos, dof_state, cano_root_state):
 def window_tokens(body_pos, dof_state, root_state, action, origin=0):
     """One window [T frames] of raw physics -> (root [T,15], body [T,420]) float32 in the window-canonical frame."""
     cp, crs, _ = canonicalize(body_pos, root_state, origin=origin)
-    r = get_repr(cp, dof_state, crs)
+    r = get_repr(cp, dof_state, crs, origin=origin)
     root = np.concatenate([r["root_trans"], r["root_rot_6d"], r["root_trans_vel"], r["root_rot_vel"]], -1)
     body = np.concatenate([r["local_positions"], r["local_vel"], r["dof_pose_6d"], r["dof_vel"], action.astype(np.float64)], -1)
     assert root.shape[1] == ROOT_DIM and body.shape[1] == BODY_DIM
@@ -195,7 +200,7 @@ def window_tokens_batch(body_pos, dof_state, root_state, action, origin=0):
     roots, bodies = [], []
     # per-frame heading + local positions are cheap; do per window to keep the reference implementation exact
     for b in range(B):
-        r = get_repr(cp[b], dof_state[b], crs[b])
+        r = get_repr(cp[b], dof_state[b], crs[b], origin=origin)
         roots.append(np.concatenate([r["root_trans"], r["root_rot_6d"], r["root_trans_vel"], r["root_rot_vel"]], -1))
         bodies.append(np.concatenate([r["local_positions"], r["local_vel"], r["dof_pose_6d"], r["dof_vel"], action[b].astype(np.float64)], -1))
     return np.stack(roots).astype(np.float32), np.stack(bodies).astype(np.float32)
@@ -213,9 +218,15 @@ FPS = 30.0
 
 
 def _heading_from_rot6d(rot6d):
-    """[..., 6] first two columns of the rotation matrix -> unit horizontal heading [..., 2] (the body x axis)."""
-    x_axis = rot6d[..., 0:3]
-    h = x_axis[..., :2]
+    """[..., 6] -> unit horizontal heading [..., 2] (the body x axis projected on the ground).
+
+    The 6-d rotation is stored as `R.as_matrix()[..., :-1].reshape(6)` (tokens are built that way, copying
+    UniPhys), i.e. the first two COLUMNS flattened row-major: [M00, M01, M10, M11, M20, M21]. The body x
+    axis in world coordinates is column 0 = (M00, M10, M20), so its horizontal part is elements 0 and 2.
+    (Taking elements 0 and 1 would be the world x axis expressed in the body frame, whose angle is the
+    NEGATED yaw.)
+    """
+    h = rot6d[..., [0, 2]]
     n = np.linalg.norm(h, axis=-1, keepdims=True)
     return h / np.clip(n, 1e-8, None)
 
@@ -244,9 +255,13 @@ def root_to_local_root(root, fps=FPS, valid=None, frame_index=None):
         out[:-1, 0] = np.arctan2(cross, dot) * fps / dt
         out[:-1, 1:3] = (pos[1:, :2] - pos[:-1, :2]) * fps / dt[:, None]
     out[:, 3] = pos[:, 2]
-    n_valid = int(valid.sum()) if valid is not None else T
-    if n_valid >= 2:  # last valid row has no successor: copy the previous row's velocity channels
-        out[n_valid - 1, :3] = out[n_valid - 2, :3]
+    if T >= 2:  # the last valid row has no successor: copy its predecessor's velocity channels.
+        # Padding may sit at either end, so locate the last valid row rather than assuming n_valid - 1.
+        last = T - 1 if valid is None else int(np.max(np.where(np.asarray(valid).astype(bool))[0]))
+        if last >= 1:
+            out[last, :3] = out[last - 1, :3]
+        else:
+            out[0, :3] = 0.0
     elif T >= 1:
         out[0, :3] = 0.0
     return out
@@ -266,15 +281,23 @@ def sample_sparse_history(l_distant, n_sparse, alpha, rng):
         return np.zeros(0, dtype=np.int64)
     if l_distant <= n_sparse:
         return np.arange(l_distant, dtype=np.int64)
-    u = rng.rand(n_sparse)
-    if alpha <= 1e-6:
-        idx = np.floor(l_distant * (1.0 - u))
-    else:
-        idx = np.floor(l_distant * (1.0 + np.log(1.0 - u * (1.0 - np.exp(-alpha))) / alpha))
-    idx = np.clip(idx, 0, l_distant - 1).astype(np.int64)
-    idx = np.unique(idx)
-    if len(idx) < n_sparse:  # fill the shortfall with the most recent frames not yet taken
+    def draw(k):
+        u = rng.rand(k)
+        if alpha <= 1e-6:
+            v = np.floor(l_distant * (1.0 - u))
+        else:
+            v = np.floor(l_distant * (1.0 + np.log(1.0 - u * (1.0 - np.exp(-alpha))) / alpha))
+        return np.clip(v, 0, l_distant - 1).astype(np.int64)
+
+    idx = np.unique(draw(n_sparse))
+    for _ in range(16):  # redraw from the SAME law instead of filling with the most recent frames,
+        if len(idx) >= n_sparse:  # which would bias the distribution towards the recent end
+            break
+        idx = np.unique(np.concatenate([idx, draw(n_sparse - len(idx))]))
+    if len(idx) > n_sparse:
+        idx = idx[:n_sparse]
+    if len(idx) < n_sparse:  # pathological alpha: fall back to the most recent unused frames
         taken = np.zeros(l_distant, bool); taken[idx] = True
         spare = np.where(~taken)[0][::-1][: n_sparse - len(idx)]
         idx = np.union1d(idx, spare)
-    return idx.astype(np.int64)
+    return np.sort(idx).astype(np.int64)

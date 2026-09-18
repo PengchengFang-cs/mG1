@@ -290,6 +290,7 @@ def collate(batch, text_cache):
     out["progress"] = torch.tensor([b["progress"] for b in batch]); out["total_len"] = torch.tensor([b["total_len"] for b in batch])
     out["mode"] = [b["mode"] for b in batch]
     out["n_sparse"] = torch.tensor([b["n_sparse"] for b in batch])
+    out["n_hist"] = torch.tensor([b["n_hist"] for b in batch]) - (T - Tmax)  # adjust for the left trim
     return out
 
 

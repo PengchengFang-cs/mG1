@@ -184,3 +184,11 @@ srun --jobid=<my_inter 作业> --overlap --ntasks=1 bash -lc 'export CUDA_VISIBL
   3b. **坐标原点移到最新历史帧**（canonicalize(origin=...)）；重算统计 token_stats_v3.npz（含 local_root_mean/std）。
   验证（CPU）：稀疏采样器 alpha 0/3/5 的均值索引 73/99.5/110（越大越偏近期）、16 个互异且在界内；canonicalize 任意 origin 处 root_trans=(0,0,h)；局部根按 gather + frame_index 与连续计算逐值一致；数据集逐样本不变量（掩码布局、frame_index 单调且边界为 −1/0、有效行数、有限值）全部通过；H_sparse=0 精确退化为旧的 48 token 窗口。
   验证（GPU）：训练冒烟 40 步（81.6M，[16|16|32]，local_root=True）损失正常下降、ckpt 正常；闭环冒烟 8 env×8 条通过（未训练模型全摔，预期）；per-window 与 batched 分词一致（root 0，body 5e-4 float32 误差）；torch 局部根与 numpy 参考一致 1.4e-6。
+- 2026-09-18 **两份独立审查（logs/hml_phys/review_v3_A.md、review_v3_B.md）发现 3 个严重缺陷，均已修复并加回归测试**（详见 docs/07 §16）：
+  1. 局部根"最后一有效行复制前一行"在**前补零**布局下索引错（约 95% 训练样本受影响，且训练/测试不一致）→ 改为按 valid 掩码定位最后一个有效行，两端补零皆正确。
+  2. `heading_quat` 把原点帧的 180° 偏航硬编码打在跨度第 0 行，而 v3 的原点已移到最新历史帧 → origin 贯穿到 get_repr/heading_quat。
+  3. 6D 旋转取错分量（取了 [M00,M01] 即世界 x 轴在机体系的表示，角度是偏航的相反数）→ 改为 [M00,M10]。经 pure-yaw 构造验证：原实现给 −0.700，正确为 +0.700。
+  其余：稀疏采样去重改为按同一分布重抽（原做法使 alpha=0 的均值 73 而非 68.5）；统计按训练采样律拟合（平均稀疏帧 7.3）；alpha 训练区间下探到 0 以覆盖均匀采样；统计缓冲区非持久化（v1/v2 ckpt 可加载，已验证 mc_v1/best_val.pt 加载成功，182M、local_root=False、自动走绝对位置编码兼容路径）；闭环加 `+hml.h_sparse/+hml.alpha/+hml.l_max` 历史旋钮（冒烟验证 [8 稀疏|16 稠密|32 未来] alpha=2.0 生效）；08_paper_metrics 的 Duration 分母去掉执行余量；CLI 默认值对齐 §14/§15。
+  **规则冲突**：训练脚本原会存 val 最低的 ckpt，违反 CLAUDE.md §1「不筛选 ckpt」→ 已停止写 best_val.pt，只按固定步数存档，val 损失仅记曲线。
+  回归测试（scripts/hml_phys/check_tokens.py 扩充）：非零 origin 下所有非原点行的朝向误差 0.000°、原点行确为 180° 偏航；局部根在前补零/后补零/无补零三种布局下一致（3e-8）、与 numpy 参考一致（1.7e-7）；批量与逐窗口分词一致。统计重算（token_stats_v3.npz）。冒烟：训练 40 步正常、不再产生 best_val.pt；闭环 8 env 通过。
+  数据加载吞吐（8 worker，bs256）：v3 窗口 63 ms/batch（4072 窗口/秒），v1 式窗口 21 ms/batch —— 约 3× 代价，但远低于 GPU 步时，不会成为瓶颈。

@@ -23,10 +23,11 @@ ap.add_argument("--H_sparse", type=int, default=16, help="v3: sparse distant his
 ap.add_argument("--L_max", type=int, default=154, help="v3: history span in frames the sparse part reaches back over")
 ap.add_argument("--alpha", type=float, default=3.0, help="v3: SCRIPT exponential bias (0 = uniform)")
 ap.add_argument("--no_randomize_history", action="store_true", help="keep H_sparse/alpha fixed instead of drawing them per sample")
+ap.add_argument("--p_no_sparse", type=float, default=0.15); ap.add_argument("--alpha_min", type=float, default=1.0); ap.add_argument("--alpha_max", type=float, default=5.0)
 ap.add_argument("--local_root", type=int, default=1, help="1: body stage sees the 4-d local root (KiMoDo/ARDY); 0: raw root token")
-ap.add_argument("--hidden", type=int, default=768); ap.add_argument("--heads", type=int, default=8)
+ap.add_argument("--hidden", type=int, default=512); ap.add_argument("--heads", type=int, default=8)
 ap.add_argument("--root_depth", default="2,4"); ap.add_argument("--body_depth", default="3,6")
-ap.add_argument("--batch", type=int, default=256); ap.add_argument("--steps", type=int, default=300000)
+ap.add_argument("--batch", type=int, default=256); ap.add_argument("--steps", type=int, default=50000)
 ap.add_argument("--lr", type=float, default=1e-4); ap.add_argument("--wd", type=float, default=0.01); ap.add_argument("--grad_clip", type=float, default=1.0)
 ap.add_argument("--ema_decay", type=float, default=0.995); ap.add_argument("--ema_every", type=int, default=10)
 ap.add_argument("--text_dropout", type=float, default=0.1)
@@ -35,7 +36,7 @@ ap.add_argument("--v_eps", type=float, default=0.05)
 ap.add_argument("--w_action", type=float, default=1.0); ap.add_argument("--w_root", type=float, default=1.0); ap.add_argument("--w_body", type=float, default=1.0)
 ap.add_argument("--w_cons", type=float, default=0.01)
 ap.add_argument("--p_rest", type=float, default=0.1); ap.add_argument("--p_neutral", type=float, default=0.05); ap.add_argument("--sigma_hist", type=float, default=0.0)
-ap.add_argument("--ckpt_every", type=int, default=50000); ap.add_argument("--val_every", type=int, default=5000); ap.add_argument("--val_windows", type=int, default=2048)
+ap.add_argument("--ckpt_every", type=int, default=10000); ap.add_argument("--val_every", type=int, default=5000); ap.add_argument("--val_windows", type=int, default=2048)
 ap.add_argument("--log_every", type=int, default=100); ap.add_argument("--workers", type=int, default=8)
 ap.add_argument("--stats", default=os.path.join(ROOT, "token_stats_v3.npz")); ap.add_argument("--env_constants", default=os.path.join(ROOT, "env_constants.npz"))
 ap.add_argument("--resume", default=""); ap.add_argument("--max_clips", type=int, default=0, help="smoke: limit clips"); ap.add_argument("--seed", type=int, default=0)
@@ -52,7 +53,8 @@ text_cache = TextCache()
 stats = TokenStats(args.stats)
 env_c = load_env_constants(args.env_constants)
 empty_idx = text_cache.index.get("", -1)
-hist_kw = dict(H_sparse=args.H_sparse, L_max=args.L_max, alpha=args.alpha)
+hist_kw = dict(H_sparse=args.H_sparse, L_max=args.L_max, alpha=args.alpha,
+               p_no_sparse=args.p_no_sparse, alpha_range=(args.alpha_min, args.alpha_max))
 train_ds = PhysWindowDataset("train", H=args.H, F=args.F, stats_path=args.stats, text_cache=text_cache, env_constants=env_c,
                              p_rest=args.p_rest, p_neutral=args.p_neutral, sigma_hist=args.sigma_hist, seed=args.seed, train=True, max_clips=args.max_clips,
                              whole_sequence=args.whole_sequence, randomize_history=not args.no_randomize_history, **hist_kw)
@@ -165,8 +167,7 @@ while step < args.steps:
         log(f"step {step} " + " ".join(f"{k}={v/args.log_every:.4f}" for k, v in run.items()) + f" {(time.time()-t0)/args.log_every*1000:.0f}ms/it"); run = {}; t0 = time.time()
     if step % args.val_every == 0 or step == args.steps:
         vl, vp = validate(); log(f"[val] step {step} loss={vl:.4f} " + " ".join(f"{k}={v:.4f}" for k, v in vp.items()))
-        if vl < best_val:
-            best_val = vl; save(os.path.join(args.out, "best_val.pt"), f"best_val={vl:.4f}")
+        best_val = min(best_val, vl)  # curve only: project CLAUDE.md §1 forbids selecting a checkpoint on val
     if step % args.ckpt_every == 0 or step == args.steps:
         save(os.path.join(args.out, f"step_{step}.pt"), "periodic")
 log("done")

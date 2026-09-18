@@ -52,7 +52,10 @@ class PhysPolicyDiT(nn.Module):
         for name, st, dim in (("root", root_stats, root_dim), ("local_root", local_root_stats, LOCAL_ROOT_DIM)):
             mean = torch.zeros(dim) if st is None else torch.as_tensor(st[0], dtype=torch.float32)
             std = torch.ones(dim) if st is None else torch.as_tensor(st[1], dtype=torch.float32)
-            self.register_buffer(f"{name}_mean", mean); self.register_buffer(f"{name}_std", std)
+            # non-persistent: they are supplied by the caller from the checkpoint's `stats` dict, so that
+            # checkpoints written before v3 (which have no such keys) still load with strict=True
+            self.register_buffer(f"{name}_mean", mean, persistent=False)
+            self.register_buffer(f"{name}_std", std, persistent=False)
         # input / output projections  (root: [z_root | z_body | mask_root | mask_body] like MotionCraft's root stage,
         # which consumes the full state; body: [bridge_root | z_body | mask_body])
         self.root_input_proj = nn.Linear((root_dim + body_dim) * 2, hidden_dim)
@@ -82,7 +85,9 @@ class PhysPolicyDiT(nn.Module):
         r = root_norm.float() * self.root_std + self.root_mean
         pos = r[..., ROOT_SLICES["root_trans"][0]:ROOT_SLICES["root_trans"][1]]
         rot6 = r[..., ROOT_SLICES["root_rot_6d"][0]:ROOT_SLICES["root_rot_6d"][1]]
-        head = rot6[..., 0:2]                                   # horizontal part of the body x axis
+        # the 6-d rotation stores the first two COLUMNS row-major: [M00,M01,M10,M11,M20,M21]; the body x
+        # axis is column 0, so its horizontal part is elements 0 and 2 (see tokens._heading_from_rot6d)
+        head = rot6[..., [0, 2]]
         head = head / head.norm(dim=-1, keepdim=True).clamp_min(1e-8)
         B, T, _ = r.shape
         out = torch.zeros(B, T, LOCAL_ROOT_DIM, device=r.device, dtype=torch.float32)
@@ -96,12 +101,18 @@ class PhysPolicyDiT(nn.Module):
             out[:, :-1, 0] = torch.atan2(cross, dot) * self.fps / dt
             out[:, :-1, 1:3] = (pos[:, 1:, :2] - pos[:, :-1, :2]) * self.fps / dt[..., None]
         out[..., 3] = pos[..., 2]
-        if T >= 2:  # last valid frame has no successor -> copy the previous row's velocity channels
-            n_valid = (valid.sum(1).long() if valid is not None
-                       else torch.full((B,), T, device=r.device, dtype=torch.long))
-            idx = (n_valid - 1).clamp(min=1)
-            src = out.gather(1, (idx - 1).view(B, 1, 1).expand(B, 1, LOCAL_ROOT_DIM))[:, 0, :3]
-            out.scatter_(1, idx.view(B, 1, 1).expand(B, 1, 3), src.unsqueeze(1))
+        if T >= 2:  # the last valid row has no successor -> copy the previous row's velocity channels.
+            # The padding may sit at the FRONT (training windows pad the unused sparse slots) or at the END
+            # (rollout windows with a short future), so locate the last valid row instead of assuming
+            # n_valid - 1, which is only correct for trailing padding.
+            if valid is None:
+                last = torch.full((B,), T - 1, device=r.device, dtype=torch.long)
+            else:
+                v = valid.to(torch.float32)
+                last = (T - 1) - torch.argmax(torch.flip(v, dims=[1]), dim=1)
+            last = last.clamp(min=1)
+            src = out.gather(1, (last - 1).view(B, 1, 1).expand(B, 1, LOCAL_ROOT_DIM))[:, 0, :3]
+            out.scatter_(1, last.view(B, 1, 1).expand(B, 1, 3), src.unsqueeze(1))
         out = (out - self.local_root_mean) / self.local_root_std
         return out.to(root_norm.dtype)
 
@@ -123,7 +134,7 @@ class PhysPolicyDiT(nn.Module):
         dtype = z_root.dtype
         tokens, pooled, pad = self.text_condition(text_tokens.to(dtype), text_pooled.to(dtype), text_len)
         cond = self.timestep_embed(t.float()).to(dtype) + pooled + self.scalar_embed(scalars.to(dtype))
-        if frame_index is None:
+        if frame_index is None:  # only valid for a contiguous, unpadded window (v1/v2 layout)
             n_hist = observed_mask.sum(1).long()
             frame_index = torch.arange(T, device=z_root.device)[None].expand(B, T) - n_hist[:, None]
         pos = frame_index.long().unsqueeze(-1)
