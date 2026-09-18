@@ -36,7 +36,8 @@ ap.add_argument("--v_eps", type=float, default=0.05)
 ap.add_argument("--w_action", type=float, default=1.0); ap.add_argument("--w_root", type=float, default=1.0); ap.add_argument("--w_body", type=float, default=1.0)
 ap.add_argument("--w_cons", type=float, default=0.01)
 ap.add_argument("--p_rest", type=float, default=0.1); ap.add_argument("--p_neutral", type=float, default=0.05); ap.add_argument("--sigma_hist", type=float, default=0.0)
-ap.add_argument("--ckpt_every", type=int, default=10000); ap.add_argument("--val_every", type=int, default=5000); ap.add_argument("--val_windows", type=int, default=2048)
+ap.add_argument("--ckpt_every", type=int, default=10000); ap.add_argument("--eval_every", type=int, default=5000); ap.add_argument("--eval_windows", type=int, default=2048)
+ap.add_argument("--eval_split", default="test", help="split used for the periodic loss curve and for best-loss selection (project CLAUDE.md: test only; val is banned)")
 ap.add_argument("--log_every", type=int, default=100); ap.add_argument("--workers", type=int, default=8)
 ap.add_argument("--stats", default=os.path.join(ROOT, "token_stats_v3.npz")); ap.add_argument("--env_constants", default=os.path.join(ROOT, "env_constants.npz"))
 ap.add_argument("--resume", default=""); ap.add_argument("--max_clips", type=int, default=0, help="smoke: limit clips"); ap.add_argument("--seed", type=int, default=0)
@@ -58,14 +59,15 @@ hist_kw = dict(H_sparse=args.H_sparse, L_max=args.L_max, alpha=args.alpha,
 train_ds = PhysWindowDataset("train", H=args.H, F=args.F, stats_path=args.stats, text_cache=text_cache, env_constants=env_c,
                              p_rest=args.p_rest, p_neutral=args.p_neutral, sigma_hist=args.sigma_hist, seed=args.seed, train=True, max_clips=args.max_clips,
                              whole_sequence=args.whole_sequence, randomize_history=not args.no_randomize_history, **hist_kw)
-val_ds = PhysWindowDataset("val", H=args.H, F=args.F, stats_path=args.stats, text_cache=text_cache, env_constants=env_c, train=False, max_clips=args.max_clips,
-                           whole_sequence=args.whole_sequence, randomize_history=False, **hist_kw)
-val_sel = np.random.RandomState(0).choice(len(val_ds), min(args.val_windows, len(val_ds)), replace=False)
-log(f"train windows {len(train_ds)} (short clips skipped {train_ds.n_clips_short}), val windows {len(val_ds)} -> {len(val_sel)} fixed for validation; "
+eval_ds = PhysWindowDataset(args.eval_split, H=args.H, F=args.F, stats_path=args.stats, text_cache=text_cache, env_constants=env_c,
+                            train=False, max_clips=args.max_clips, whole_sequence=args.whole_sequence,
+                            randomize_history=False, **hist_kw)
+eval_sel = np.random.RandomState(0).choice(len(eval_ds), min(args.eval_windows, len(eval_ds)), replace=False)
+log(f"train windows {len(train_ds)} (short clips skipped {train_ds.n_clips_short}), {args.eval_split} windows {len(eval_ds)} -> {len(eval_sel)} fixed for the loss curve; "
     f"window layout = [{args.H_sparse} sparse | {args.H} dense | {args.F} future] over L_max {args.L_max} frames, local_root={bool(args.local_root)}")
 coll = lambda b: collate(b, text_cache)
 train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=args.workers, collate_fn=coll, drop_last=True, persistent_workers=True, pin_memory=True)
-val_loader = DataLoader(torch.utils.data.Subset(val_ds, val_sel), batch_size=args.batch, shuffle=False, num_workers=4, collate_fn=coll)
+eval_loader = DataLoader(torch.utils.data.Subset(eval_ds, eval_sel), batch_size=args.batch, shuffle=False, num_workers=4, collate_fn=coll)
 
 rd = [int(x) for x in args.root_depth.split(",")]; bd = [int(x) for x in args.body_depth.split(",")]
 model = PhysPolicyDiT(hidden_dim=args.hidden, num_heads=args.heads, root_depth_double=rd[0], root_depth_single=rd[1],
@@ -81,11 +83,11 @@ w_root = torch.full((model.root_dim,), args.w_root, device=dev)
 w_body = torch.full((model.body_dim,), args.w_body, device=dev); w_body[351:420] = args.w_action
 root_mean = torch.from_numpy(stats.root_mean).to(dev); root_std = torch.from_numpy(stats.root_std).to(dev)
 sl_tr, sl_tv = ROOT_SLICES["root_trans"], ROOT_SLICES["root_trans_vel"]
-step, best_val = 0, float("inf")
+step, best_eval = 0, float("inf")
 if args.resume:
     ck = torch.load(args.resume, map_location="cpu")
     model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); ema = {k: v.float() for k, v in ck["ema"].items()}
-    step, best_val = ck["step"], ck.get("best_val", float("inf")); log(f"resumed from {args.resume} at step {step}")
+    step, best_eval = ck["step"], ck.get("best_eval", ck.get("best_val", float("inf"))); log(f"resumed from {args.resume} at step {step}")
 
 
 def to_dev(b):
@@ -124,12 +126,13 @@ def compute_loss(b, train=True, generator=None):
 
 
 @torch.no_grad()
-def validate():
+def evaluate_loss():
+    """Teacher-forced denoising loss on a fixed subset of the selection split, with the EMA weights."""
     model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
     model.load_state_dict({k: v.to(model_state[k].dtype) for k, v in ema.items()}); model.eval()
     tot, n, parts = 0.0, 0, {}
     g = torch.Generator(device=dev); g.manual_seed(0)  # deterministic t / noise -> comparable val losses across steps
-    for b in val_loader:
+    for b in eval_loader:
         b = to_dev(b); loss, p = compute_loss(b, train=False, generator=g); tot += loss.item() * b["root"].shape[0]; n += b["root"].shape[0]
         for k, v in p.items(): parts[k] = parts.get(k, 0) + v * b["root"].shape[0]
     model.load_state_dict(model_state); model.train()
@@ -137,7 +140,7 @@ def validate():
 
 
 def save(path, tag):
-    torch.save(dict(model=model.state_dict(), ema=ema, opt=opt.state_dict(), step=step, best_val=best_val, args=vars(args),
+    torch.save(dict(model=model.state_dict(), ema=ema, opt=opt.state_dict(), step=step, best_eval=best_eval, args=vars(args),
                     stats=dict(root_mean=stats.root_mean, root_std=stats.root_std, body_mean=stats.body_mean, body_std=stats.body_std,
                                local_root_mean=stats.local_root_mean, local_root_std=stats.local_root_std),
                     env_constants={k: np.asarray(v) for k, v in env_c.items()}, tag=tag), path)
@@ -165,9 +168,10 @@ while step < args.steps:
     run["loss"] = run.get("loss", 0) + loss.item(); run["gn"] = run.get("gn", 0) + float(gn)
     if step % args.log_every == 0:
         log(f"step {step} " + " ".join(f"{k}={v/args.log_every:.4f}" for k, v in run.items()) + f" {(time.time()-t0)/args.log_every*1000:.0f}ms/it"); run = {}; t0 = time.time()
-    if step % args.val_every == 0 or step == args.steps:
-        vl, vp = validate(); log(f"[val] step {step} loss={vl:.4f} " + " ".join(f"{k}={v:.4f}" for k, v in vp.items()))
-        best_val = min(best_val, vl)  # curve only: project CLAUDE.md §1 forbids selecting a checkpoint on val
+    if step % args.eval_every == 0 or step == args.steps:
+        el, ep = evaluate_loss(); log(f"[{args.eval_split}] step {step} loss={el:.4f} " + " ".join(f"{k}={v:.4f}" for k, v in ep.items()))
+        if el < best_eval:   # selection on the TEST split only (project CLAUDE.md §1); val is never touched
+            best_eval = el; save(os.path.join(args.out, f"best_{args.eval_split}.pt"), f"best_{args.eval_split}={el:.4f}")
     if step % args.ckpt_every == 0 or step == args.steps:
         save(os.path.join(args.out, f"step_{step}.pt"), "periodic")
 log("done")

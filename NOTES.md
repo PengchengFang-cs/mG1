@@ -192,3 +192,4 @@ srun --jobid=<my_inter 作业> --overlap --ntasks=1 bash -lc 'export CUDA_VISIBL
   **规则冲突**：训练脚本原会存 val 最低的 ckpt，违反 CLAUDE.md §1「不筛选 ckpt」→ 已停止写 best_val.pt，只按固定步数存档，val 损失仅记曲线。
   回归测试（scripts/hml_phys/check_tokens.py 扩充）：非零 origin 下所有非原点行的朝向误差 0.000°、原点行确为 180° 偏航；局部根在前补零/后补零/无补零三种布局下一致（3e-8）、与 numpy 参考一致（1.7e-7）；批量与逐窗口分词一致。统计重算（token_stats_v3.npz）。冒烟：训练 40 步正常、不再产生 best_val.pt；闭环 8 env 通过。
   数据加载吞吐（8 worker，bs256）：v3 窗口 63 ms/batch（4072 窗口/秒），v1 式窗口 21 ms/batch —— 约 3× 代价，但远低于 GPU 步时，不会成为瓶颈。
+- 2026-09-18 用户指示：**训练期的周期性损失与「最低损失」存档一律用测试集**（`--eval_split test`，默认），不再碰 val。train_mc.py 改为 eval_split/eval_every/eval_windows，存 `best_test.pt` 与固定步数 ckpt；CLAUDE.md §1 同步更新，并注明该损失是 teacher-forced 去噪损失、只用于挑 ckpt，最终汇报仍须来自测试集完整闭环协议。冒烟通过（best_test.pt 正常写出）。
