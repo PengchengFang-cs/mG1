@@ -16,11 +16,13 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--rollouts", nargs="+", required=True)
 ap.add_argument("--split", default="test")
 ap.add_argument("--fallen", default="exclude", choices=["exclude", "truncate"])
-ap.add_argument("--replications", type=int, default=20)
+ap.add_argument("--replications", type=int, default=1, help="project CLAUDE.md §4: permanently 1, nothing else is accepted")
 ap.add_argument("--drop_prefix_20fps", type=int, default=0, help="frames dropped at the start (CLoSD drops 16 sim frames = ~11 @20fps)")
 ap.add_argument("--mm_min_reps", type=int, default=0, help=">0: compute MultiModality from captions having at least this many repeated episodes (mm_times=10)")
 ap.add_argument("--out", required=True)
 args = ap.parse_args()
+if args.replications != 1:
+    raise SystemExit("repeated evaluation is permanently banned (project CLAUDE.md §4): --replications must be 1")
 
 episodes = []
 for p in args.rollouts:

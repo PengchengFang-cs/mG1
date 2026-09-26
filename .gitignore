@@ -22,3 +22,9 @@ vendor_kimodo/
 vendor_motioncraft/
 vendor_ardy/
 vendor_moge_umo/
+vendor_mogeflow/
+vendor_momask/
+.aris/
+external/
+vendor_motionstreamer/
+*.bak

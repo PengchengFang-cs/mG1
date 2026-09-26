@@ -8,7 +8,11 @@ import torch
 import torch.nn.functional as F
 
 
-def sample_t(batch, device, p_mean=-0.8, p_std=0.8, eps=1e-4, generator=None):
+def sample_t(batch, device, p_mean=-0.8, p_std=0.8, eps=1e-4, generator=None, dist="logit_normal"):
+    if dist == "uniform":
+        return torch.rand(batch, device=device, generator=generator).clamp(eps, 1 - eps)
+    if dist != "logit_normal":
+        raise ValueError(f"unknown t distribution {dist}")
     n = torch.randn(batch, device=device, generator=generator)
     return torch.sigmoid(n * p_std + p_mean).clamp(eps, 1 - eps)
 
@@ -81,3 +85,32 @@ def euler_sample(model, x_obs_root, x_obs_body, mask_frames, text, text_uncond, 
     x0r = x0r * (1 - m) + x_obs_root * m
     x0b = x0b * (1 - m) + x_obs_body * m
     return x0r, x0b
+
+
+@torch.no_grad()
+def euler_sample_single(model, x_obs, mask_frames, text, text_uncond, scalars, num_steps=32, cfg_scale=3.5,
+                        v_eps=1e-4, generator=None, valid=None, frame_index=None):
+    """Single-token (part-structured) variant of euler_sample: one [B,T,435] stream instead of (root, body)."""
+    B, T, _ = x_obs.shape
+    dev = x_obs.device
+    m = mask_frames[..., None].to(x_obs.dtype)
+    z = torch.randn(x_obs.shape, device=dev, generator=generator, dtype=x_obs.dtype) * (1 - m) + x_obs * m
+    grid = torch.linspace(0, 1, num_steps + 1, device=dev)
+    for i in range(num_steps):
+        t = grid[i].expand(B); dt = grid[i + 1] - grid[i]
+        if cfg_scale != 1.0:
+            zz = torch.cat([z, z]); mm = torch.cat([mask_frames, mask_frames])
+            tok = torch.cat([text_uncond[0], text[0]]); po = torch.cat([text_uncond[1], text[1]]); ln = torch.cat([text_uncond[2], text[2]])
+            sc = torch.cat([scalars, scalars]); tt = torch.cat([t, t]); vv = None if valid is None else torch.cat([valid, valid])
+            fi = None if frame_index is None else torch.cat([frame_index, frame_index])
+            x = model(zz, mm, tt, tok, po, ln, sc, valid=vv, frame_index=fi)
+            x = x[:B] + cfg_scale * (x[B:] - x[:B])
+        else:
+            x = model(z, mask_frames, t, text[0], text[1], text[2], scalars, valid=valid, frame_index=frame_index)
+        if i == num_steps - 1:
+            x0 = x
+            break
+        denom = (1.0 - t.view(-1, 1, 1)).clamp_min(v_eps)
+        z = z + dt * (x - z) / denom
+        z = z * (1 - m) + x_obs * m
+    return x0 * (1 - m) + x_obs * m

@@ -15,13 +15,13 @@ run_roll () {  # tag ckpt items out steps cfg
 # ---- val screening
 for tag in best_val step_50000 step_100000 step_250000; do
   run_roll val_$tag $D/outputs/mc_v1/$tag.pt $D/data/humanml3d_phys/rollout_items_val_random.json $D/data/humanml3d_phys/rollouts_mc_v1_${tag}_val_e10.pkl 10 3.5
-  python scripts/hml_phys/07_eval_rollouts.py --rollouts data/humanml3d_phys/rollouts_mc_v1_${tag}_val_e10.pkl --split val --fallen exclude --replications 5 --out data/humanml3d_phys/eval_mc_v1_${tag}_val_e10.json 2>&1 | grep -a "episodes \|^top1 \|^fid \|^mm_dist \|duration\|physics_gen_raw\|Traceback"
+  python scripts/hml_phys/07_eval_rollouts.py --rollouts data/humanml3d_phys/rollouts_mc_v1_${tag}_val_e10.pkl --split val --fallen exclude --replications 1 --out data/humanml3d_phys/eval_mc_v1_${tag}_val_e10.json 2>&1 | grep -a "episodes \|^top1 \|^fid \|^mm_dist \|duration\|physics_gen_raw\|Traceback"
 done
 echo "==== VAL SCREENING DONE"
 # ---- test: final (250k) and best_val, full protocol
 for tag in step_250000 best_val; do
   run_roll test_$tag $D/outputs/mc_v1/$tag.pt $D/data/humanml3d_phys/rollout_items_test_random.json $D/data/humanml3d_phys/rollouts_mc_v1_${tag}_test.pkl 32 3.5
-  python scripts/hml_phys/07_eval_rollouts.py --rollouts data/humanml3d_phys/rollouts_mc_v1_${tag}_test.pkl --fallen exclude --replications 20 --out data/humanml3d_phys/eval_mc_v1_${tag}_test_exclude.json 2>&1 | grep -a "episodes \|^top1 \|^top2 \|^top3 \|^fid \|^mm_dist \|^diversity \|duration\|physics_gen_raw\|Traceback"
-  python scripts/hml_phys/07_eval_rollouts.py --rollouts data/humanml3d_phys/rollouts_mc_v1_${tag}_test.pkl --fallen truncate --replications 5 --out data/humanml3d_phys/eval_mc_v1_${tag}_test_truncate.json 2>&1 | grep -a "^top1 \|^fid \|Traceback"
+  python scripts/hml_phys/07_eval_rollouts.py --rollouts data/humanml3d_phys/rollouts_mc_v1_${tag}_test.pkl --fallen exclude --replications 1 --out data/humanml3d_phys/eval_mc_v1_${tag}_test_exclude.json 2>&1 | grep -a "episodes \|^top1 \|^top2 \|^top3 \|^fid \|^mm_dist \|^diversity \|duration\|physics_gen_raw\|Traceback"
+  python scripts/hml_phys/07_eval_rollouts.py --rollouts data/humanml3d_phys/rollouts_mc_v1_${tag}_test.pkl --fallen truncate --replications 1 --out data/humanml3d_phys/eval_mc_v1_${tag}_test_truncate.json 2>&1 | grep -a "^top1 \|^fid \|Traceback"
 done
 echo "==== ALL DONE"

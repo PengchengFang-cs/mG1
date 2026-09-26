@@ -1,15 +1,35 @@
 # motion_rebot 项目死规定（永久，覆盖一切默认行为）
 
-## 1. 禁用 val（2026-09-16，用户命令）
-- **禁止对 val 划分做任何操作**：不 rollout、不评测、不筛选 ckpt、不扫超参、不汇报 val 数字、不生成 val 的 rollout 条目。
-- 一切选择（ckpt、CFG、采样步数、任何超参）**只在 HumanML3D 测试集、完整协议下**做。
-- 训练脚本内部的周期性损失曲线与「最低损失」存档一律用**测试集**（`--eval_split test`），不碰 val。
-- 已有的 val 相关脚本产物（rollout_items_val_random.json、rollouts_mc_v1_*_val_*、eval_mc_v1_*_val_*、eval_mc_chain2.sh）视为作废，不再使用。
-- 训练期的测试集损失是 teacher-forced 去噪损失，只用于挑 ckpt；最终汇报的数字仍必须来自测试集上的完整闭环协议。
-
-## 2. 汇报格式
-- 任何数字都必须放进完整对照表：运动学真值、物理真值、UniPhys（自跑 + 论文）、PDP、CLoSD、Kimodo++、MIND、SCRIPT、我们，所有指标（R@1/2/3、FID、MM-Dist、Diversity、Floating、Jerk、Duration），注明划分与评估器。表在 docs/06_hml_phys_protocol.md §2.1b，每次更新后整表汇报，禁止只报自己的数字。
-
+## 1. 划分的使用规则（2026-09-16 初定；2026-09-25 用户澄清，覆盖此前表述）
+- **判据看该数据集有几个划分**：
+  - **有 train / val / test 三份时**（例：HumanML3D 物理数据集 `hml_phys_{train,val,test}.pkl`）：**val 一律忽略**
+    —— 不 rollout、不评测、不筛选 ckpt、不扫超参、不汇报 val 数字、不生成 val 的 rollout 条目。
+    一切选择（ckpt、CFG、采样步数、任何超参）**只在测试集、完整协议下**做。
+  - **只有 train / val 两份时**（例：G1 的 `BABEL-AMASS-ROBOT-23dof-FULL-50fps/{train,val}.pkl`）：
+    **train 训练、val 评测**。此时 val 就是该数据集的评测划分，正常使用、正常汇报。
+- 训练脚本内部的周期性损失曲线与「最低损失」存档，一律用**该数据集的评测划分**
+  （三划分时是 test，两划分时是 val）。
+- 已有的 val 相关作废产物（HumanML3D 侧：rollout_items_val_random.json、rollouts_mc_v1_*_val_*、
+  eval_mc_v1_*_val_*、eval_mc_chain2.sh）仍然作废，不再使用 —— 那是三划分数据集上的 val。
+- 训练期的测试集/验证集损失是 teacher-forced 去噪损失，只用于挑 ckpt；最终汇报的数字仍必须来自
+  该划分上的完整闭环协议。
+## 2. 汇报格式（2026-09-21 用户改定；2026-09-23 补充可比性纪律）
+- **只汇报五个指标**：R@1、R@2、R@3、FID、Duration。其余（MM-Dist、Diversity、Floating、Jerk、Skating、摔倒率等）只写进 docs，不放进汇报表，除非用户专门问。
+- **主表只放同尺度的行**：我们的运动学真值 / 物理真值 / UniPhys 官方权重自跑 / 我们的模型。全部 Guo 评估器、同一测试子集、同一 rollout 协议。
+- **MIND / SCRIPT 的数字一律不与我们并列**：它们用自训评估器（真值 Diversity 1.24 / 1.49，Guo 是 9.5），只能单独放一块并标注「各自评估器，仅供趋势参考」。CLoSD 是 Guo 评估器（真值 Diversity 9.51、MM-Dist 2.95），可以列但要标注协议细节未知。详见 docs/06 §2.2b。
+- **「相对自家物理真值」的归一化不再作为主结论**，它假设评估器线性可比，从未验证。
+- **FID、Duration 跨论文一律不比**。可跨论文比的只有 Floating / Penetration / Foot-sliding。
+- 我们自己的行只列当前最好的一两个版本，不再把历史版本全部铺开。
+- **一律用「截断摔倒」口径做任何 R@1/R@2/R@3/FID 的比较**（保留全部 4646 条，摔倒处截断）。
+  「排除摔倒」口径只在摔倒率相近时才可比：它只在存活片段上算分，摔得越多、剩下的片段越容易、R@1 被动虚高。
+  实例（2026-09-23）：排除口径下「10万+CFG2.0」R@1 0.4298 领先「10万+CFG2.5」的 0.4227；
+  换成截断口径后反转（0.3919 vs 0.3997）。同一批扫描里据排除口径得出的两个结论因此被推翻。
+- 注明划分（HumanML3D 测试集）与评估器，并写明「单次 rollout、单次计算」（§4）。
 ## 3. 卡与实验
 - 不经用户明确批准不启动任何训练；评测只用用户指定的卡；不占用户其他项目的卡。
 - scancel 永久禁用；停止训练只允许杀本项目的进程。
+
+## 4. 评测永久只跑一次（2026-09-19，用户命令，永久）
+- **每个 ckpt 只做 1 次闭环 rollout，指标只算 1 次**：`--replications 1`，代码里已写死（`hml_phys/evaluator.py` 断言、`07/05/04` 脚本传别的值直接报错退出）。
+- **永久禁止任何形式的重复**：不做 20 次（或任何次数）的指标重复计算，不跑多个随机种子，不对同一个 ckpt 重跑 rollout，不做多次重复求置信区间。没有例外开关。
+- 汇报时如实写明「单次 rollout、单次计算」，不再写 ±。

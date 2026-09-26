@@ -15,8 +15,8 @@ run_roll () {
 for tag in step_50000 best_val step_10000 step_20000 step_30000 step_40000; do
   [ -f $D/outputs/mc_v2/$tag.pt ] || { echo "missing $tag"; continue; }
   run_roll test_$tag $D/outputs/mc_v2/$tag.pt $D/data/humanml3d_phys/rollout_items_test_random.json $D/data/humanml3d_phys/rollouts_mc_v2_${tag}_test.pkl 32 3.5
-  python scripts/hml_phys/07_eval_rollouts.py --rollouts data/humanml3d_phys/rollouts_mc_v2_${tag}_test.pkl --fallen exclude --replications 20 --out data/humanml3d_phys/eval_mc_v2_${tag}_test_exclude.json 2>&1 | grep -a "episodes \|^top1 \|^top2 \|^top3 \|^fid \|^mm_dist \|^diversity \|duration_completion\|physics_gen_raw\|Traceback"
-  python scripts/hml_phys/07_eval_rollouts.py --rollouts data/humanml3d_phys/rollouts_mc_v2_${tag}_test.pkl --fallen truncate --replications 5 --out data/humanml3d_phys/eval_mc_v2_${tag}_test_truncate.json 2>&1 | grep -a "^top1 \|^fid \|Traceback"
+  python scripts/hml_phys/07_eval_rollouts.py --rollouts data/humanml3d_phys/rollouts_mc_v2_${tag}_test.pkl --fallen exclude --replications 1 --out data/humanml3d_phys/eval_mc_v2_${tag}_test_exclude.json 2>&1 | grep -a "episodes \|^top1 \|^top2 \|^top3 \|^fid \|^mm_dist \|^diversity \|duration_completion\|physics_gen_raw\|Traceback"
+  python scripts/hml_phys/07_eval_rollouts.py --rollouts data/humanml3d_phys/rollouts_mc_v2_${tag}_test.pkl --fallen truncate --replications 1 --out data/humanml3d_phys/eval_mc_v2_${tag}_test_truncate.json 2>&1 | grep -a "^top1 \|^fid \|Traceback"
   echo "==== $tag DONE"
 done
 echo "==== V2 CHAIN DONE"

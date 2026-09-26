@@ -70,3 +70,31 @@ rb, bb = window_tokens_batch(bp, ds, rs, ac)
 diff = max(max(np.abs(rb[j] - window_tokens(bp[j], ds[j], rs[j], ac[j])[0]).max(), np.abs(bb[j] - window_tokens(bp[j], ds[j], rs[j], ac[j])[1]).max()) for j in range(len(idx)))
 print(f"batched vs per-window max abs diff: {diff:.2e}")
 print("PASS" if max(worst.values()) < 1e-4 and diff < 1e-4 and worst_origin < 1e-3 else "FAIL")
+
+# ---- v4 part partition (docs/07 §17): disjoint, complete, and each part owns its own joints' channels
+from hml_phys.tokens import PART_NAMES, _PART_BODIES, part_channels, part_dims, action_channels_in_token, ROOT_DIM, BODY_DIM
+_ch = part_channels()
+_all = np.concatenate(_ch)
+assert sorted(_all.tolist()) == list(range(ROOT_DIM + BODY_DIM)), "part partition must cover 0..434 exactly once"
+assert sum(part_dims()) == ROOT_DIM + BODY_DIM
+_act = set(action_channels_in_token().tolist())
+assert _act == set(range(ROOT_DIM + 351, ROOT_DIM + 420)), "action channels must be token 366..434"
+for _n, _c in zip(PART_NAMES, _ch):
+    _bodies = _PART_BODIES[_n]
+    _joints = sorted({b - 1 for b in _bodies if b > 0})
+    # local_positions / local_vel blocks (3 per body), dof_pose_6d (6 per joint), dof_vel / action (3 per joint)
+    _want = set()
+    for b in _bodies:
+        _want |= set(range(ROOT_DIM + 3 * b, ROOT_DIM + 3 * b + 3))            # local_positions
+        _want |= set(range(ROOT_DIM + 72 + 3 * b, ROOT_DIM + 72 + 3 * b + 3))  # local_vel
+    for j in _joints:
+        _want |= set(range(ROOT_DIM + 144 + 6 * j, ROOT_DIM + 144 + 6 * j + 6))  # dof_pose_6d
+        _want |= set(range(ROOT_DIM + 282 + 3 * j, ROOT_DIM + 282 + 3 * j + 3))  # dof_vel
+        _want |= set(range(ROOT_DIM + 351 + 3 * j, ROOT_DIM + 351 + 3 * j + 3))  # action
+    if _n == "root":
+        _want |= set(range(ROOT_DIM))
+    assert set(_c.tolist()) == _want, f"part {_n}: channel set does not match bodies {_bodies} / joints {_joints}"
+_x = np.random.randn(2, 5, ROOT_DIM + BODY_DIM).astype(np.float32)
+_inv = np.argsort(_all)
+assert np.array_equal(np.concatenate([_x[..., c] for c in _ch], -1)[..., _inv], _x), "part gather/scatter round trip"
+print(f"part partition OK: {dict(zip(PART_NAMES, part_dims()))}, all 23 joints' actions owned exactly once, round trip exact")

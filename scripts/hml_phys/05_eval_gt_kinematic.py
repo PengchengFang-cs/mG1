@@ -12,12 +12,14 @@ from hml_phys.sim2hml import joints_to_hml263, hml263_to_joints
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--split", default="test")
-ap.add_argument("--replications", type=int, default=20)
+ap.add_argument("--replications", type=int, default=1, help="project CLAUDE.md §4: permanently 1, nothing else is accepted")
 ap.add_argument("--n_convert_check", type=int, default=0, help="legacy check against the local new_joints/ directory (that directory is NOT consistent with new_joint_vecs/; keep 0)")
 ap.add_argument("--out", default="data/humanml3d_phys/eval_gt_kinematic.json")
 ap.add_argument("--gt_via_converter", action="store_true", help="rebuild GT 263-d from new_joints through our converter (converter validation)")
 ap.add_argument("--joints_source", default="recover", choices=["recover", "new_joints"], help="recover: joints = recover_from_ric(new_joint_vecs) (official positions); new_joints: local new_joints files")
 args = ap.parse_args()
+if args.replications != 1:
+    raise SystemExit("repeated evaluation is permanently banned (project CLAUDE.md §4): --replications must be 1")
 
 t0 = time.time()
 items, dropped = build_gt_items(args.split)

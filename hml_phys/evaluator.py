@@ -4,7 +4,7 @@
 * Inputs are RAW (un-normalised) 263-d HumanML3D features; normalisation with the evaluator's own
   meta mean/std happens here (that is what the official Text2MotionDatasetEval does).
 * Metrics: R-Precision top-1/2/3, FID, MM-Dist, Diversity (300), MultiModality (optional),
-  batch 32 with drop_last, repeated `replications` times, mean and 95% CI.
+  batch 32 with drop_last, computed ONCE (replications=1, enforced; project CLAUDE.md §4 bans repeated evaluation permanently).
 * GT loader reproduces Text2MotionDatasetEval exactly (min len 40, < 200, sub-clip captions with
   time tags, random caption choice, unit-length quantisation, random crop, zero-pad to 196).
 
@@ -184,13 +184,14 @@ class HMLEvaluator:
             n += BATCH; ems.append(em)
         return r_prec, match, n, np.concatenate(ems, 0)
 
-    def evaluate(self, gt_items, gen_items=None, replications=20, seed=0, diversity_times=300,
+    def evaluate(self, gt_items, gen_items=None, replications=1, seed=0, diversity_times=300,
                  gen_official_crop=False, unique_per_key=True, mm_items=None, mm_times=10,
                  physics=True, log=print):
         """gen_items=None evaluates GT against itself (sanity: R@1≈0.511, FID≈0.002 for HumanML3D test)."""
         rng = np.random.RandomState(seed)
         np.random.seed(seed)  # calculate_diversity / multimodality use np.random
         per_rep = []
+        assert replications == 1, "repeated evaluation is permanently banned (project CLAUDE.md §4)"
         for r in range(replications):
             gt_r, gt_m, gt_n, gt_em = self._run_set(gt_items, rng, official_crop=True)
             mu_gt, cov_gt = calculate_activation_statistics(gt_em)

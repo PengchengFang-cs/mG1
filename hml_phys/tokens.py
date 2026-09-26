@@ -301,3 +301,61 @@ def sample_sparse_history(l_distant, n_sparse, alpha, rng):
         spare = np.where(~taken)[0][::-1][: n_sparse - len(idx)]
         idx = np.union1d(idx, spare)
     return np.sort(idx).astype(np.int64)
+
+
+
+# ============================================================================================
+# Part-structured grouping of the 435-d token (MoGeFlow style, docs/07 §17)
+# The full token is [root 15 | body 420]; the body blocks are local_positions (24x3), local_vel (24x3),
+# dof_pose_6d (23x6), dof_vel (23x3), action (23x3). Joint j actuates body j+1.
+# Six disjoint groups, exactly covering all 435 channels: root is group 0, a peer of the other five.
+# ============================================================================================
+PART_NAMES = ["root", "spine", "left_arm", "right_arm", "left_leg", "right_leg"]
+_PART_BODIES = {                      # MuJoCo body order (see MUJOCO_2_SMPL in hml_phys/sim2hml.py)
+    "root": [0],                      # Pelvis
+    "spine": [9, 10, 11, 12, 13],     # Torso, Spine, Chest, Neck, Head
+    "left_arm": [14, 15, 16, 17, 18],  # L_Thorax, L_Shoulder, L_Elbow, L_Wrist, L_Hand
+    "right_arm": [19, 20, 21, 22, 23],
+    "left_leg": [1, 2, 3, 4],          # L_Hip, L_Knee, L_Ankle, L_Toe
+    "right_leg": [5, 6, 7, 8],
+}
+
+
+def _token_offsets():
+    o = {"root_token": 0}
+    base = ROOT_DIM
+    for name, (a, b) in BODY_SLICES.items():
+        o[name] = base + a
+    return o
+
+
+def part_channels():
+    """-> list of 6 int arrays: the token channel indices owned by each part (disjoint, covering 0..434)."""
+    o = _token_offsets()
+    out = []
+    for name in PART_NAMES:
+        idx = []
+        if name == "root":
+            idx += list(range(ROOT_DIM))                       # root_trans, root_rot_6d, root_trans_vel, root_rot_vel
+        for b in _PART_BODIES[name]:
+            idx += [o["local_positions"] + 3 * b + k for k in range(3)]
+            idx += [o["local_vel"] + 3 * b + k for k in range(3)]
+            j = b - 1                                          # joint j actuates body j+1; the pelvis has none
+            if j >= 0:
+                idx += [o["dof_pose_6d"] + 6 * j + k for k in range(6)]
+                idx += [o["dof_vel"] + 3 * j + k for k in range(3)]
+                idx += [o["action"] + 3 * j + k for k in range(3)]
+        out.append(np.asarray(sorted(idx), dtype=np.int64))
+    all_idx = np.concatenate(out)
+    assert len(all_idx) == ROOT_DIM + BODY_DIM and len(np.unique(all_idx)) == len(all_idx), \
+        f"parts must partition the token exactly, got {len(all_idx)} / {len(np.unique(all_idx))}"
+    return out
+
+
+def part_dims():
+    return [len(c) for c in part_channels()]
+
+
+def action_channels_in_token():
+    a, b = BODY_SLICES["action"]
+    return np.arange(ROOT_DIM + a, ROOT_DIM + b, dtype=np.int64)

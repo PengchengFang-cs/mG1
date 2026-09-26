@@ -1,10 +1,12 @@
 """Train the physics policy DiT (docs/07 §10 / §12).
 
-  loss = flow (velocity space, future frames, per-stream channel weights)
+  loss = flow (velocity space, future frames; two_stage: root mean + body mean; part: mean over the 6 parts of each
+         part's channel mean, as in MoGeFlow)
        + w_cons * root position/velocity consistency on the de-normalised x0 prediction (future frames):
          (root_trans[t+1] - root_trans[t]) * 30 vs root_trans_vel[t]   (smooth-L1)
   AdamW lr 1e-4 wd 0.01, grad clip 1.0, bf16 autocast, EMA 0.995 every 10 steps (MotionCraft defaults);
-  text dropout 0.1 -> empty caption; checkpoints every --ckpt_every steps + best val loss (EMA weights evaluated).
+  text dropout 0.1 -> empty caption; checkpoints every --ckpt_every steps + lowest TEST loss (EMA weights evaluated;
+  project CLAUDE.md bans val entirely).
 """
 import argparse, json, math, os, sys, time
 import numpy as np, torch
@@ -12,8 +14,9 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, "/iridisfs/scratch/pf2m24/projects/motion_rebot")
 from hml_phys.dataset import PhysWindowDataset, TextCache, TokenStats, collate, load_env_constants, ROOT
 from hml_phys.mc_model import PhysPolicyDiT
+from hml_phys.part_model import PartPhysPolicyDiT, TOKEN_DIM
 from hml_phys import flow as fl
-from hml_phys.tokens import ROOT_SLICES
+from hml_phys.tokens import ROOT_SLICES, ROOT_DIM, action_channels_in_token, part_channels, PART_NAMES
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--out", required=True)
@@ -25,12 +28,22 @@ ap.add_argument("--alpha", type=float, default=3.0, help="v3: SCRIPT exponential
 ap.add_argument("--no_randomize_history", action="store_true", help="keep H_sparse/alpha fixed instead of drawing them per sample")
 ap.add_argument("--p_no_sparse", type=float, default=0.15); ap.add_argument("--alpha_min", type=float, default=0.0); ap.add_argument("--alpha_max", type=float, default=5.0)
 ap.add_argument("--local_root", type=int, default=1, help="1: body stage sees the 4-d local root (KiMoDo/ARDY); 0: raw root token")
+ap.add_argument("--arch", default="two_stage", choices=["two_stage", "part"],
+                help="two_stage: root DiT -> local-root bridge -> body DiT (v1-v3); part: MoGeFlow-style 6 parts through one shared trunk (v4)")
 ap.add_argument("--hidden", type=int, default=512); ap.add_argument("--heads", type=int, default=8)
+ap.add_argument("--depth", default="3,6", help="part arch: double,single block counts of the shared trunk")
+ap.add_argument("--mlp_ratio", type=float, default=4.0); ap.add_argument("--dropout", type=float, default=0.0)
+ap.add_argument("--text_xattn", type=int, default=0, help="part arch: 1 = gated text cross-attention after each double block (v5, docs/07 §18)")
+ap.add_argument("--xgate_lr_mult", type=float, default=1.0,
+                help="learning-rate multiplier for the 3 scalar cross-attention gates (own param group, no weight decay)")
+ap.add_argument("--text_mode", default="joint_tokens", choices=["joint_tokens", "sentence_xattn", "xattn_only"],
+                help="sentence_xattn = moge_UMO_ST sentence mode: 1 sentence token in joint attention, no text in AdaLN, words only via cross-attention (docs/07 §18.1)")
 ap.add_argument("--root_depth", default="2,4"); ap.add_argument("--body_depth", default="3,6")
 ap.add_argument("--batch", type=int, default=256); ap.add_argument("--steps", type=int, default=50000)
 ap.add_argument("--lr", type=float, default=1e-4); ap.add_argument("--wd", type=float, default=0.01); ap.add_argument("--grad_clip", type=float, default=1.0)
 ap.add_argument("--ema_decay", type=float, default=0.995); ap.add_argument("--ema_every", type=int, default=10)
 ap.add_argument("--text_dropout", type=float, default=0.1)
+ap.add_argument("--t_dist", default="logit_normal", choices=["logit_normal", "uniform"])
 ap.add_argument("--p_mean", type=float, default=-0.8); ap.add_argument("--p_std", type=float, default=0.8)
 ap.add_argument("--v_eps", type=float, default=0.05)
 ap.add_argument("--w_action", type=float, default=1.0); ap.add_argument("--w_root", type=float, default=1.0); ap.add_argument("--w_body", type=float, default=1.0)
@@ -48,7 +61,6 @@ os.makedirs(args.out, exist_ok=True)
 log_f = open(os.path.join(args.out, "train_log.txt"), "a")
 def log(*a):
     s = " ".join(str(x) for x in a); print(s, flush=True); log_f.write(s + "\n"); log_f.flush()
-log("args", json.dumps(vars(args)))
 dev = torch.device("cuda")
 text_cache = TextCache()
 stats = TokenStats(args.stats)
@@ -69,25 +81,74 @@ coll = lambda b: collate(b, text_cache)
 train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=args.workers, collate_fn=coll, drop_last=True, persistent_workers=True, pin_memory=True)
 eval_loader = DataLoader(torch.utils.data.Subset(eval_ds, eval_sel), batch_size=args.batch, shuffle=False, num_workers=4, collate_fn=coll)
 
+if args.resume:   # the architecture comes from the checkpoint; re-typing the flags is not required
+    _ra = torch.load(args.resume, map_location="cpu")["args"]
+    for k in ("arch", "hidden", "heads", "depth", "root_depth", "body_depth", "mlp_ratio", "dropout", "local_root", "text_xattn", "text_mode", "xgate_lr_mult"):
+        if k in _ra and getattr(args, k) != _ra[k]:
+            log(f"resume: {k} {getattr(args, k)} -> {_ra[k]} (from checkpoint)"); setattr(args, k, _ra[k])
+    del _ra
 rd = [int(x) for x in args.root_depth.split(",")]; bd = [int(x) for x in args.body_depth.split(",")]
-model = PhysPolicyDiT(hidden_dim=args.hidden, num_heads=args.heads, root_depth_double=rd[0], root_depth_single=rd[1],
-                      body_depth_double=bd[0], body_depth_single=bd[1], text_token_dim=text_cache.tokens.shape[2],
-                      text_pooled_dim=text_cache.dim, max_text_tokens=text_cache.max_tokens,
-                      local_root=bool(args.local_root), root_stats=(stats.root_mean, stats.root_std),
-                      local_root_stats=(stats.local_root_mean, stats.local_root_std)).to(dev)
-log(f"model params {model.num_params()/1e6:.1f}M")
-opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+if args.text_xattn and args.arch != "part":
+    raise SystemExit("--text_xattn is only implemented for --arch part")
+if args.text_mode != "joint_tokens" and not (args.arch == "part" and args.text_xattn):
+    raise SystemExit(f"--text_mode {args.text_mode} needs --arch part --text_xattn 1")
+if args.arch == "part":
+    dd = [int(x) for x in args.depth.split(",")]
+    # MoGeFlow constraint: hidden = 6 parts * part_dim AND every part boundary falls on a head boundary,
+    # i.e. part_dim (= hidden/6) is a whole number of head_dim (= hidden/heads)  <=>  heads % 6 == 0.
+    # No choice of `hidden` can repair an unsuitable head count, so that one is a hard error.
+    # RoPE additionally needs an even head_dim -> hidden % (2*heads) == 0.
+    if args.heads % 6 != 0:
+        raise SystemExit(f"--arch part needs --heads a multiple of 6 (6 parts, whole heads per part); got {args.heads}. Use 12.")
+    step_h = 2 * args.heads
+    hidden = (args.hidden // step_h) * step_h
+    if hidden != args.hidden:
+        log(f"hidden {args.hidden} is not a multiple of 2*heads = {step_h}; using {hidden}")
+    args.hidden = hidden
+    model = PartPhysPolicyDiT(hidden_dim=hidden, num_heads=args.heads, depth_double=dd[0], depth_single=dd[1],
+                              mlp_ratio=args.mlp_ratio, dropout=args.dropout,
+                              text_token_dim=text_cache.tokens.shape[2], text_pooled_dim=text_cache.dim,
+                              max_text_tokens=text_cache.max_tokens, text_cross_attention=bool(args.text_xattn),
+                              text_mode=args.text_mode).to(dev)
+    log(f"part arch: hidden {hidden} = 6 x {model.part_dim}, {args.heads} heads x {hidden//args.heads}, "
+        f"{dd[0]} double + {dd[1]} single, part dims {model.dims}, text cross-attention {bool(args.text_xattn)}, text mode {args.text_mode}")
+else:
+    model = PhysPolicyDiT(hidden_dim=args.hidden, num_heads=args.heads, root_depth_double=rd[0], root_depth_single=rd[1],
+                          body_depth_double=bd[0], body_depth_single=bd[1], text_token_dim=text_cache.tokens.shape[2],
+                          text_pooled_dim=text_cache.dim, max_text_tokens=text_cache.max_tokens,
+                          local_root=bool(args.local_root), root_stats=(stats.root_mean, stats.root_std),
+                          local_root_stats=(stats.local_root_mean, stats.local_root_std)).to(dev)
+log("args", json.dumps(vars(args)))
+log(f"model params {model.num_params()/1e6:.1f}M (trainable {model.num_params(True)/1e6:.1f}M)")
+if getattr(model, "text_cross_attention", False) and args.xgate_lr_mult != 1.0:
+    gate_ids = {id(g) for g in model.xattn_gates}
+    opt = torch.optim.AdamW([
+        dict(params=[p for p in model.parameters() if id(p) not in gate_ids]),
+        dict(params=list(model.xattn_gates), lr=args.lr * args.xgate_lr_mult, weight_decay=0.0)],
+        lr=args.lr, weight_decay=args.wd)
+    log(f"cross-attention gates: own param group, lr x{args.xgate_lr_mult:g}, no weight decay")
+else:
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
 ema = {k: v.detach().clone().float() for k, v in model.state_dict().items()}
 # channel weights: root stream all w_root; body stream w_body for state, w_action for the 69 action dims
-w_root = torch.full((model.root_dim,), args.w_root, device=dev)
-w_body = torch.full((model.body_dim,), args.w_body, device=dev); w_body[351:420] = args.w_action
+if args.arch == "part":
+    w_tok = torch.full((TOKEN_DIM,), args.w_body, device=dev)
+    w_tok[:ROOT_DIM] = args.w_root
+    w_tok[torch.from_numpy(action_channels_in_token()).to(dev)] = args.w_action
+else:
+    w_root = torch.full((model.root_dim,), args.w_root, device=dev)
+    w_body = torch.full((model.body_dim,), args.w_body, device=dev); w_body[351:420] = args.w_action
+part_index_t = [torch.from_numpy(c).to(dev) for c in part_channels()]
 root_mean = torch.from_numpy(stats.root_mean).to(dev); root_std = torch.from_numpy(stats.root_std).to(dev)
 sl_tr, sl_tv = ROOT_SLICES["root_trans"], ROOT_SLICES["root_trans_vel"]
 step, best_eval = 0, float("inf")
 if args.resume:
     ck = torch.load(args.resume, map_location="cpu")
-    model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); ema = {k: v.float() for k, v in ck["ema"].items()}
-    step, best_eval = ck["step"], ck.get("best_eval", ck.get("best_val", float("inf"))); log(f"resumed from {args.resume} at step {step}")
+    model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); ema = {k: v.float().to(dev) for k, v in ck["ema"].items()}
+    # best-loss threshold only carries over when it was measured on the same (test) split; a pre-rule val loss is ignored
+    same_split = ck.get("args", {}).get("eval_split") == args.eval_split
+    step, best_eval = ck["step"], (ck.get("best_eval", float("inf")) if same_split else float("inf"))
+    log(f"resumed from {args.resume} at step {step} (best {args.eval_split} loss carried over: {best_eval})")
 
 
 def to_dev(b):
@@ -107,14 +168,31 @@ def compute_loss(b, train=True, generator=None):
     root, body, mask, valid = b["root"], b["body"], b["observed_mask"], b["valid"]
     fidx = b["frame_index"]
     B = root.shape[0]
-    t = fl.sample_t(B, dev, args.p_mean, args.p_std, generator=generator)
-    zr, _, _ = fl.build_state(root, mask, t, generator=generator); zb, _, _ = fl.build_state(body, mask, t, generator=generator)
+    t = fl.sample_t(B, dev, args.p_mean, args.p_std, generator=generator, dist=args.t_dist)
     scalars = torch.stack([b["progress"], b["total_len"] / 10.0], -1).float()
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        xr, xb = model(zr, zb, mask, t, b["text_tokens"], b["text_pooled"], b["text_len"], scalars, valid=valid, frame_index=fidx)
-    xr, xb = xr.float(), xb.float()
-    vr_hat, vr = fl.velocity_pair(xr, root, zr, t, args.v_eps); vb_hat, vb = fl.velocity_pair(xb, body, zb, t, args.v_eps)
-    l_root = fl.masked_mse(vr_hat, vr, mask, w_root, valid); l_body = fl.masked_mse(vb_hat, vb, mask, w_body, valid)
+    if args.arch == "part":
+        # one stream: the six parts are channel groups of the same 435-d token
+        x0 = torch.cat([root, body], -1)
+        z, _, _ = fl.build_state(x0, mask, t, generator=generator)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            xh = model(z, mask, t, b["text_tokens"], b["text_pooled"], b["text_len"], scalars, valid=valid, frame_index=fidx)
+        xh = xh.float()
+        v_hat, v = fl.velocity_pair(xh, x0, z, t, args.v_eps)
+        # MoGeFlow (part_structured_motion_code_flow.py:289-290): mean over a part's channels, then equal weight per part,
+        # so the 21-channel root part counts as much as a 90-channel arm. w_root/w_body/w_action act inside each part.
+        per_part = [fl.masked_mse(v_hat[..., c], v[..., c], mask, w_tok[c], valid) for c in part_index_t]
+        l_flow = torch.stack(per_part).mean()
+        parts_dbg = dict(zip([f"p_{n}" for n in PART_NAMES], torch.stack(per_part).detach().tolist()))
+        xr = xh[..., :ROOT_DIM]
+        l_root, l_body = l_flow, torch.zeros((), device=dev)
+    else:
+        zr, _, _ = fl.build_state(root, mask, t, generator=generator); zb, _, _ = fl.build_state(body, mask, t, generator=generator)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            xr, xb = model(zr, zb, mask, t, b["text_tokens"], b["text_pooled"], b["text_len"], scalars, valid=valid, frame_index=fidx)
+        xr, xb = xr.float(), xb.float()
+        vr_hat, vr = fl.velocity_pair(xr, root, zr, t, args.v_eps); vb_hat, vb = fl.velocity_pair(xb, body, zb, t, args.v_eps)
+        l_root = fl.masked_mse(vr_hat, vr, mask, w_root, valid); l_body = fl.masked_mse(vb_hat, vb, mask, w_body, valid)
+        parts_dbg = {}
     # root position/velocity consistency on de-normalised x0 (future frames only)
     xr_un = xr * root_std + root_mean
     d_pos = (xr_un[:, 1:, sl_tr[0]:sl_tr[1]] - xr_un[:, :-1, sl_tr[0]:sl_tr[1]]) * 30.0
@@ -122,6 +200,8 @@ def compute_loss(b, train=True, generator=None):
     fut_pair = ((1 - mask[:, 1:]) * (1 - mask[:, :-1]) * valid[:, 1:] * valid[:, :-1])
     l_cons = fl.masked_smooth_l1(d_pos, vel, fut_pair)
     loss = l_root + l_body + args.w_cons * l_cons
+    if args.arch == "part":
+        return loss, dict(flow=l_root.item(), cons=l_cons.item(), **parts_dbg)
     return loss, dict(flow_root=l_root.item(), flow_body=l_body.item(), cons=l_cons.item())
 
 
@@ -167,7 +247,10 @@ while step < args.steps:
     for k, v in parts.items(): run[k] = run.get(k, 0) + v
     run["loss"] = run.get("loss", 0) + loss.item(); run["gn"] = run.get("gn", 0) + float(gn)
     if step % args.log_every == 0:
-        log(f"step {step} " + " ".join(f"{k}={v/args.log_every:.4f}" for k, v in run.items()) + f" {(time.time()-t0)/args.log_every*1000:.0f}ms/it"); run = {}; t0 = time.time()
+        gates = ""
+        if getattr(model, "text_cross_attention", False):
+            gates = " xgate=[" + ",".join(f"{float(torch.tanh(g)):+.2e}" for g in model.xattn_gates) + "]"
+        log(f"step {step} " + " ".join(f"{k}={v/args.log_every:.4f}" for k, v in run.items()) + gates + f" {(time.time()-t0)/args.log_every*1000:.0f}ms/it"); run = {}; t0 = time.time()
     if step % args.eval_every == 0 or step == args.steps:
         el, ep = evaluate_loss(); log(f"[{args.eval_split}] step {step} loss={el:.4f} " + " ".join(f"{k}={v:.4f}" for k, v in ep.items()))
         if el < best_eval:   # selection on the TEST split only (project CLAUDE.md §1); val is never touched

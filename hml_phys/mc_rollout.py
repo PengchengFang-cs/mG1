@@ -13,21 +13,79 @@ import numpy as np, torch, joblib
 from tqdm import tqdm
 from hml_phys import tokens as tk, flow as fl
 from hml_phys.mc_model import PhysPolicyDiT
+from hml_phys.part_model import PartPhysPolicyDiT
 from hml_phys.dataset import TokenStats, TextCache, norm_caption
 from hml_phys.tokens import sample_sparse_history
 from hml_phys.text_clip import ClipText
 
 
+PROJECT = "/iridisfs/scratch/pf2m24/projects/motion_rebot"
+
+
+def load_intent_policy(ck, device="cuda", weights="ema"):
+    """route A (docs/07 §21): IntentPolicy + the frozen intent VAE and its latent normalisation."""
+    from hml_phys.intent_model import IntentPolicy
+    from hml_phys.intent_vae import load_intent_vae
+    a = ck["args"]
+    model = IntentPolicy(ck["policy_kw"], a["intent_dim"], a["intent_heads"], a["intent_depth"], a["intent_mlp"], 768)
+    sd = ck["ema"] if weights == "ema" else ck["model"]
+    model.load_state_dict({k: v.to(model.state_dict()[k].dtype) for k, v in sd.items()}); model.to(device).eval()
+    vae_path = a["vae"] if os.path.isabs(a["vae"]) else os.path.join(PROJECT, a["vae"])
+    model.vae, _ = load_intent_vae(vae_path, device)
+    model.lat_mean = torch.from_numpy(np.asarray(ck["latent_stats"]["mean"])).to(device)
+    model.lat_std = torch.from_numpy(np.asarray(ck["latent_stats"]["std"])).to(device)
+    return model
+
+
+def load_codeflow_policy(ck, device="cuda", weights="ema"):
+    """CodeFlow (docs/08 §10): a flow over the codes of a FROZEN RVQ tokenizer.
+
+    `args["rvq_obs"]`, when the checkpoint has it, is the 码本对照 control's second frozen tokenizer: the one
+    that encodes the observed history (the full 435-channel token) while `args["rvq"]` stays the tokenizer the
+    policy generates and decodes in.
+    """
+    from hml_phys.codeflow import CodeFlowPolicy
+    a = ck["args"]
+    abspath = lambda p: p if os.path.isabs(p) else os.path.join(PROJECT, p)
+    rvq = abspath(a["rvq"])
+    rvq_obs = abspath(a["rvq_obs"]) if a.get("rvq_obs") else None
+    model = CodeFlowPolicy(rvq, device=device, hidden_dim=a["hidden"], num_heads=a["heads"],
+                           depth_double=a["depth_double"], depth_single=a["depth_single"],
+                           text_mode=a.get("text_mode", "joint_tokens"),
+                           text_cross_attention=bool(a.get("text_xattn", 0)), rvq_obs_ckpt=rvq_obs)
+    sd = ck["ema"] if weights == "ema" else ck["model"]
+    model.policy.load_state_dict({k: v.to(model.policy.state_dict()[k].dtype) for k, v in sd.items()})
+    model.policy.to(device).eval()
+    return model
+
+
 def load_policy(ckpt_path, device="cuda", weights="ema"):
     ck = torch.load(ckpt_path, map_location="cpu")
     a = ck["args"]
+    if a.get("rvq"):
+        from hml_phys.dataset import load_env_constants
+        stats = TokenStats(a["stats"])
+        return load_codeflow_policy(ck, device, weights), stats, load_env_constants(), a, ck["step"]
+    if a.get("arch") == "intent":
+        st = ck["stats"]
+        stats = TokenStats.__new__(TokenStats)
+        stats.root_mean, stats.root_std, stats.body_mean, stats.body_std = st["root_mean"], st["root_std"], st["body_mean"], st["body_std"]
+        return load_intent_policy(ck, device, weights), stats, ck["env_constants"], a, ck["step"]
     rd = [int(x) for x in a["root_depth"].split(",")]; bd = [int(x) for x in a["body_depth"].split(",")]
     st = ck["stats"]
-    model = PhysPolicyDiT(hidden_dim=a["hidden"], num_heads=a["heads"], root_depth_double=rd[0], root_depth_single=rd[1],
-                          body_depth_double=bd[0], body_depth_single=bd[1], text_token_dim=768, text_pooled_dim=768, max_text_tokens=50,
-                          local_root=bool(a.get("local_root", 0)),
-                          root_stats=(st["root_mean"], st["root_std"]),
-                          local_root_stats=(st.get("local_root_mean", np.zeros(4, np.float32)), st.get("local_root_std", np.ones(4, np.float32))))
+    if a.get("arch", "two_stage") == "part":
+        dd = [int(x) for x in a["depth"].split(",")]
+        model = PartPhysPolicyDiT(hidden_dim=a["hidden"], num_heads=a["heads"], depth_double=dd[0], depth_single=dd[1],
+                                  mlp_ratio=float(a.get("mlp_ratio", 4.0)),
+                                  text_token_dim=768, text_pooled_dim=768, max_text_tokens=50,
+                                  text_cross_attention=bool(a.get("text_xattn", 0)),
+                                  text_mode=a.get("text_mode", "joint_tokens"))
+    else:
+        model = PhysPolicyDiT(hidden_dim=a["hidden"], num_heads=a["heads"], root_depth_double=rd[0], root_depth_single=rd[1],
+                              body_depth_double=bd[0], body_depth_single=bd[1], text_token_dim=768, text_pooled_dim=768, max_text_tokens=50,
+                              local_root=bool(a.get("local_root", 0)),
+                              root_stats=(st["root_mean"], st["root_std"]),
+                              local_root_stats=(st.get("local_root_mean", np.zeros(4, np.float32)), st.get("local_root_std", np.ones(4, np.float32))))
     sd = ck["ema"] if weights == "ema" else ck["model"]
     model.load_state_dict({k: v.to(model.state_dict()[k].dtype) for k, v in sd.items()}); model.to(device).eval()
     stats = TokenStats.__new__(TokenStats)
@@ -53,7 +111,8 @@ class HistoryBuffer:
 
 
 def run_rollouts_mc(experiment, items, out_path, ckpt, save_every=1, seed=0, K=4, num_steps=32, cfg_scale=3.5,
-                    weights="ema", h_sparse_override=None, alpha_override=None, l_max_override=None):
+                    weights="ema", h_sparse_override=None, alpha_override=None, l_max_override=None,
+                    s_read_override=None):
     exp = experiment; player = exp.player; env = player.env; task = env.task
     dev = torch.device("cuda")
     # the imitation env would otherwise terminate episodes that drift >0.25 m from its hidden reference motion
@@ -64,9 +123,41 @@ def run_rollouts_mc(experiment, items, out_path, ckpt, save_every=1, seed=0, K=4
         np.allclose(np.asarray(envc["pd_scale"]), task._pd_action_scale.cpu().numpy(), atol=1e-5), "checkpoint PD offset/scale differ from the live env"
     if "Start" not in str(task._state_init):
         print(f"WARNING: env state init is {task._state_init}, protocol expects StateInit.Start (fixed standing pose)")
-    H, F = int(margs["H"]), int(margs["F"]); T = H + F
+    is_intent = margs.get("arch") == "intent"            # route A: HIP + IIP + action-only policy (docs/07 §21)
+    is_cf = bool(margs.get("rvq"))                       # CodeFlow: a flow over a frozen tokenizer's codes (docs/08 §10)
+    if is_cf:
+        from hml_phys.codeflow_flow import latent_mask, sample_codes
+        from hml_phys.rvq_data import variant_channels
+        assert model.variant != "state", \
+            "the state tokenizer carries no action channels, so a state CodeFlow policy cannot drive the robot"
+        # two channel sets, identical unless the checkpoint is the 码本对照 control (--rvq_obs):
+        #   cf_obs_ch -> what the OBSERVATION tokenizer is fed (the full 435-channel token in the control)
+        #   cf_ch     -> what the GENERATION tokenizer emits, and where the executed actions are read from
+        cf_obs_ch = torch.from_numpy(variant_channels(model.obs_variant).astype(np.int64)).to(dev)
+        cf_ch = torch.from_numpy(variant_channels(model.variant).astype(np.int64)).to(dev)
+        t_mean, t_std = np.concatenate([stats.root_mean, stats.body_mean]), np.concatenate([stats.root_std, stats.body_std])
+        cf_mean = torch.from_numpy(t_mean[cf_ch.cpu().numpy()].astype(np.float32)).to(dev)
+        cf_std = torch.from_numpy(t_std[cf_ch.cpu().numpy()].astype(np.float32)).to(dev)
+        # where the 69 action channels sit inside the GENERATION variant's own channel list
+        act_tok = np.arange(tk.ROOT_DIM + 351, tk.ROOT_DIM + 420)
+        cf_act = torch.from_numpy(np.searchsorted(variant_channels(model.variant), act_tok).astype(np.int64)).to(dev)
+        H = int(margs["n_hist"]); F = int(margs["window"]) - H
+        n_lat, n_lat_hist = int(margs["window"]) // model.down, H // model.down
+    if is_intent:
+        H, F = int(margs["H"]), int(margs["F_act"])
+    elif not is_cf:
+        H, F = int(margs["H"]), int(margs["F"])
+    T = H + F
     whole = bool(margs.get("whole_sequence", False))  # v2: future = remaining frames of the episode (capped at F)
     is_v3 = "H_sparse" in margs      # checkpoints trained before v3 used absolute positions and no sparse history
+    is_part = margs.get("arch", "two_stage") == "part"   # v4: one stream of 6 body parts instead of root+body stages
+    if is_intent:
+        from hml_phys import intent_flow as ifl
+        from hml_phys.intent_data import vae_history_input
+        act_mask = ifl.action_channel_mask(dev)
+        s_read = float(margs.get("cond_aug_test", 0.75)) if float(margs.get("cond_aug", 0.0)) > 0 else 1.0
+        if s_read_override is not None:      # test-time knob: how clean a latent the intent hidden states are read at
+            s_read = float(s_read_override)
     H_sparse = int(margs.get("H_sparse", 0)); L_max = int(margs.get("L_max", H)); alpha = float(margs.get("alpha", 3.0))
     if h_sparse_override is not None:   # test-time history knob (docs/07 §15 改动 3)
         H_sparse = int(h_sparse_override)
@@ -83,7 +174,8 @@ def run_rollouts_mc(experiment, items, out_path, ckpt, save_every=1, seed=0, K=4
     gen = torch.Generator(device=dev); gen.manual_seed(seed); np.random.seed(seed)
     print(f"MC policy rollout: ckpt step {ckpt_step} ({weights}), {len(items)} items, {num_envs} envs, "
           f"window [{H_sparse} sparse | {H} dense | {F} future] over L_max {L_max}, alpha {alpha}, K={K}, "
-          f"Euler {num_steps}, cfg {cfg_scale}, local_root={model.local_root}, "
+          f"Euler {num_steps}, cfg {cfg_scale}, arch={margs.get('arch','two_stage')}, "
+          f"local_root={getattr(model, 'local_root', 'n/a')}, text_xattn={getattr(getattr(model, 'policy', model), 'text_cross_attention', False)}, text_mode={getattr(getattr(model, 'policy', model), 'text_mode', 'joint_tokens')}, "
           f"positions={'signed (v3)' if is_v3 else 'absolute (v1/v2 compat)'}, stateInit={task._state_init}")
     episodes, neutral_state = [], None
     if os.path.exists(out_path):
@@ -110,6 +202,16 @@ def run_rollouts_mc(experiment, items, out_path, ckpt, save_every=1, seed=0, K=4
         tok, pool, tl = clip_enc.encode(captions)
         text = (torch.from_numpy(tok).to(dev), torch.from_numpy(pool).to(dev), torch.from_numpy(tl).to(dev))
         text_u = (torch.from_numpy(np.repeat(empty_tok, num_envs, 0)).to(dev), torch.from_numpy(np.repeat(empty_pool, num_envs, 0)).to(dev), torch.from_numpy(np.repeat(empty_len, num_envs, 0)).to(dev))
+        if is_intent:   # HIP: one holistic intent per episode, from the text alone (MIND §4.3)
+            ones_b = torch.ones(num_envs, device=dev)
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                mem_c, mv_c = model.adapter(text[0].float(), text[2])
+                mem_u, mv_u = model.adapter(text_u[0].float(), text_u[2])
+                I_H = ifl.sample_latent(model.hip, num_envs, mem_c, mv_c, mem_u, mv_u, num_steps=num_steps,
+                                        cfg_scale=cfg_scale, generator=gen, device=dev)
+                # hidden states read at the checkpoint's test level: 1.0 = clean latent (§21.4-4), else §21.8 b
+                hH_c = ifl.intent_hidden(model.hip, I_H, s_read, gen, mem=mem_c, mem_valid=mv_c)
+                hH_u = ifl.intent_hidden(model.hip, I_H, s_read, gen, mem=mem_u, mem_valid=mv_u)
         obs = player.env_reset()
         bp, ds, rs = read_state()
         if neutral_state is None:
@@ -123,46 +225,92 @@ def run_rollouts_mc(experiment, items, out_path, ckpt, save_every=1, seed=0, K=4
             obs, r, done, info = player.env_step(env, hold)
             bp, ds, rs = read_state(); hist.push(bp, ds, rs, hold.cpu().numpy())
         while not np.all(is_done | (episode_length >= targets)):
-            # ---- plan. Window = [sparse distant history | dense recent history | future], exactly as in
-            # training: tokens are computed on the contiguous buffer span and the chosen rows are gathered,
-            # so every row keeps its true instantaneous velocities and its signed frame offset.
-            if whole:
-                fut = np.clip(targets - episode_length, K, F)
+            if is_cf:
+                # CodeFlow plan: the last H real frames canonicalised on their OWN first frame -> the frozen
+                # tokenizer's codes (observed) -> flow -> the next H frames' codes -> frozen decoder -> actions.
+                # History and future are encoded as separate windows, exactly as in training (docs/08 §10).
+                # 码本对照 control: the observed half goes through the observation tokenizer (435 channels) and
+                # only the generated half is decoded by the action tokenizer -- again exactly as in training.
+                rh = slice(hist.L - H, hist.L)
+                root_h, body_h = tk.window_tokens_batch(hist.bp[:, rh], hist.ds[:, rh], hist.rs[:, rh],
+                                                        hist.ac[:, rh], origin=0)
+                root_h, body_h = stats.norm(root_h, body_h)
+                xh = torch.from_numpy(np.concatenate([root_h, body_h], -1)).to(dev).index_select(-1, cf_obs_ch)
+                progress = np.clip(episode_length / np.maximum(1.0, total_len * 30.0), 0, 1)
+                scal = torch.from_numpy(np.stack([progress, total_len / 10.0], -1)).float().to(dev)
+                with torch.no_grad():
+                    # [B, n_lat_hist, Q*D]; the control encodes the history with its own (435-channel) tokenizer
+                    z_obs, _ = model.encode_obs(xh) if model.dual else model.encode_window(xh)
+                    x0_obs = torch.cat([z_obs, z_obs.new_zeros(num_envs, n_lat - n_lat_hist, z_obs.shape[-1])], 1)
+                    obsm, genm = latent_mask(num_envs, n_lat, n_lat_hist, dev)
+                    codes, _ = sample_codes(model, x0_obs, obsm, genm, text, text_u, scal,
+                                            num_steps=num_steps, cfg_scale=cfg_scale, generator=gen)
+                    # standalone decode of the future, always through the GENERATION tokenizer
+                    dec = model.rvq.decode(codes=codes[:, n_lat_hist:, None])
+                act_n = dec.index_select(-1, cf_act).float()
+                actions = (act_n * cf_std[cf_act] + cf_mean[cf_act]).cpu().numpy()[:, :K]
             else:
-                fut = np.full(num_envs, F)
-            Fb = int(fut.max())
-            n_real = int(hist.n)                                   # real frames in the buffer
-            l_distant = int(min(L_max - H, max(0, n_real - H)))    # frames available before the dense history
-            dense0 = hist.L - H                                    # dense history starts here in the ring
-            span0 = dense0 - l_distant
-            raw_bp = np.concatenate([hist.bp[:, span0:], np.repeat(hist.bp[:, -1:], Fb, 1)], 1)
-            raw_ds = np.concatenate([hist.ds[:, span0:], np.repeat(hist.ds[:, -1:], Fb, 1)], 1)
-            raw_rs = np.concatenate([hist.rs[:, span0:], np.repeat(hist.rs[:, -1:], Fb, 1)], 1)
-            raw_ac = np.concatenate([hist.ac[:, span0:], np.repeat(hist.ac[:, -1:], Fb, 1)], 1)
-            sparse = sample_sparse_history(l_distant, H_sparse, alpha, rng_np)   # indices into [span0, dense0)
-            rows = np.concatenate([sparse, np.arange(l_distant, l_distant + H + Fb)]).astype(np.int64)
-            fidx = rows - (l_distant + H)                          # 0 = first generated frame
-            n_hist = len(sparse) + H
-            origin = int(rows[n_hist - 1])
-            root_full, body_full = tk.window_tokens_batch(raw_bp, raw_ds, raw_rs, raw_ac, origin=origin)
-            root, body = root_full[:, rows], body_full[:, rows]
-            root, body = stats.norm(root, body)
-            Tb = len(rows)
-            xr = torch.from_numpy(root).to(dev); xb = torch.from_numpy(body).to(dev)
-            xr[:, n_hist:] = 0; xb[:, n_hist:] = 0
-            mask = torch.zeros(num_envs, Tb, device=dev); mask[:, :n_hist] = 1.0
-            valid = (torch.arange(Tb, device=dev)[None] < (n_hist + torch.from_numpy(fut).to(dev))[:, None]).float()
-            if is_v3:
-                frame_index = torch.from_numpy(fidx).to(dev).long()[None].expand(num_envs, Tb).contiguous()
-            else:   # v1/v2 were trained with pos = arange(T); keep their exact text<->motion offsets
-                frame_index = torch.arange(Tb, device=dev).long()[None].expand(num_envs, Tb).contiguous()
-            progress = np.clip(episode_length / np.maximum(1.0, total_len * 30.0), 0, 1)
-            scal = torch.from_numpy(np.stack([progress, total_len / 10.0], -1)).float().to(dev)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                x0r, x0b = fl.euler_sample(model, xr, xb, mask, text, text_u, scal, num_steps=num_steps,
-                                           cfg_scale=cfg_scale, generator=gen, valid=valid, frame_index=frame_index)
-            _, body_un = stats.denorm(x0r.float().cpu().numpy(), x0b.float().cpu().numpy())
-            actions = body_un[:, n_hist:n_hist + K, 351:420]  # [B,K,69]
+                # ---- plan. Window = [sparse distant history | dense recent history | future], exactly as in
+                # training: tokens are computed on the contiguous buffer span and the chosen rows are gathered,
+                # so every row keeps its true instantaneous velocities and its signed frame offset.
+                if whole:
+                    fut = np.clip(targets - episode_length, K, F)
+                else:
+                    fut = np.full(num_envs, F)
+                Fb = int(fut.max())
+                n_real = int(hist.n)                                   # real frames in the buffer
+                l_distant = int(min(L_max - H, max(0, n_real - H)))    # frames available before the dense history
+                dense0 = hist.L - H                                    # dense history starts here in the ring
+                span0 = dense0 - l_distant
+                raw_bp = np.concatenate([hist.bp[:, span0:], np.repeat(hist.bp[:, -1:], Fb, 1)], 1)
+                raw_ds = np.concatenate([hist.ds[:, span0:], np.repeat(hist.ds[:, -1:], Fb, 1)], 1)
+                raw_rs = np.concatenate([hist.rs[:, span0:], np.repeat(hist.rs[:, -1:], Fb, 1)], 1)
+                raw_ac = np.concatenate([hist.ac[:, span0:], np.repeat(hist.ac[:, -1:], Fb, 1)], 1)
+                sparse = sample_sparse_history(l_distant, H_sparse, alpha, rng_np)   # indices into [span0, dense0)
+                rows = np.concatenate([sparse, np.arange(l_distant, l_distant + H + Fb)]).astype(np.int64)
+                fidx = rows - (l_distant + H)                          # 0 = first generated frame
+                n_hist = len(sparse) + H
+                origin = int(rows[n_hist - 1])
+                root_full, body_full = tk.window_tokens_batch(raw_bp, raw_ds, raw_rs, raw_ac, origin=origin)
+                root, body = root_full[:, rows], body_full[:, rows]
+                root, body = stats.norm(root, body)
+                Tb = len(rows)
+                xr = torch.from_numpy(root).to(dev); xb = torch.from_numpy(body).to(dev)
+                xr[:, n_hist:] = 0; xb[:, n_hist:] = 0
+                mask = torch.zeros(num_envs, Tb, device=dev); mask[:, :n_hist] = 1.0
+                valid = (torch.arange(Tb, device=dev)[None] < (n_hist + torch.from_numpy(fut).to(dev))[:, None]).float()
+                if is_v3:
+                    frame_index = torch.from_numpy(fidx).to(dev).long()[None].expand(num_envs, Tb).contiguous()
+                else:   # v1/v2 were trained with pos = arange(T); keep their exact text<->motion offsets
+                    frame_index = torch.arange(Tb, device=dev).long()[None].expand(num_envs, Tb).contiguous()
+                progress = np.clip(episode_length / np.maximum(1.0, total_len * 30.0), 0, 1)
+                scal = torch.from_numpy(np.stack([progress, total_len / 10.0], -1)).float().to(dev)
+                if is_intent:   # history intent from the dense 16 history rows (same rows / origin as in training)
+                    st_hist = vae_history_input(torch.cat([xr[:, n_hist - H:n_hist], xb[:, n_hist - H:n_hist, :tk.STATE_DIM]], -1))
+                    with torch.no_grad():
+                        I_h = (model.vae.encode(st_hist.float())[1] - model.lat_mean) / model.lat_std
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    if is_intent:
+                        I_I = ifl.sample_latent(model.iip, num_envs, mem_c, mv_c, mem_u, mv_u, num_steps=num_steps,
+                                                cfg_scale=cfg_scale, generator=gen, prefix=I_h, scalars=scal,
+                                                extra=hH_c, extra_u=hH_u, device=dev)
+                        hI_c = ifl.intent_hidden(model.iip, I_I, s_read, gen, mem=mem_c, mem_valid=mv_c, prefix_latent=I_h,
+                                                 scalars=scal, mem_extra=hH_c)
+                        toks, _ = model.intent_tokens(hH_c, hI_c, torch.ones(num_envs, dtype=torch.bool, device=dev))
+                        x_obs = ifl.policy_input(torch.cat([xr, xb], -1), mask, act_mask)
+                        gen_el = ifl.generated_elements(mask, valid, act_mask)
+                        x0 = ifl.sample_actions(model.policy, x_obs, mask, gen_el, text, text_u, scal, toks, num_steps=num_steps,
+                                                cfg_scale=cfg_scale, generator=gen, valid=valid, frame_index=frame_index)
+                        x0r, x0b = x0[..., :tk.ROOT_DIM], x0[..., tk.ROOT_DIM:]
+                    elif is_part:
+                        x0 = fl.euler_sample_single(model, torch.cat([xr, xb], -1), mask, text, text_u, scal, num_steps=num_steps,
+                                                    cfg_scale=cfg_scale, generator=gen, valid=valid, frame_index=frame_index)
+                        x0r, x0b = x0[..., :tk.ROOT_DIM], x0[..., tk.ROOT_DIM:]
+                    else:
+                        x0r, x0b = fl.euler_sample(model, xr, xb, mask, text, text_u, scal, num_steps=num_steps,
+                                                   cfg_scale=cfg_scale, generator=gen, valid=valid, frame_index=frame_index)
+                _, body_un = stats.denorm(x0r.float().cpu().numpy(), x0b.float().cpu().numpy())
+                actions = body_un[:, n_hist:n_hist + K, 351:420]  # [B,K,69]
             # ---- execute K actions
             for k in range(K):
                 a = torch.from_numpy(actions[:, k]).to(dev).float()
