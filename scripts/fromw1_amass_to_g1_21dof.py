@@ -16,7 +16,7 @@ So this script stands in for the missing G1 driver. Everything load-bearing is t
     not change between the 21/23/29-DoF variants, which are one robot with joints locked;
   * the 30 Hz resampling and the occlusion filter are transcribed from
     `scripts/data_process/process_amass_db.py:175-195`;
-  * the robot config comes from `fromw1_g1_21dof_config.py`, parsed out of their `g1_21dof.xml`.
+  * the robot config comes from `hml_phys/g1_21dof_config.py`, parsed out of their `g1_21dof.xml`.
 
 Four places where theirs could not be used as-is, each a deliberate, recorded choice (docs/09 §6.6):
 
@@ -99,7 +99,7 @@ def main():
         args.occlusion or REPO / "UniPhys/sample_data/amass_copycat_occlusion_v3.pkl"
     ).resolve()
 
-    sys.path.insert(0, str(REPO / "scripts"))
+    sys.path.insert(0, str(REPO))
     # The retarget package resolves "assets/...", "models/smpl" relative to its own root, and importing
     # body_retarget loads the SMPL parser and the G1 betas at module level, so chdir first.
     os.chdir(RETARGET)
@@ -108,7 +108,7 @@ def main():
     from body_retarget.robot import Humanoid_Batch                      # noqa: E402
     from body_retarget.smpl_parser import SMPL_Parser, SMPL_BONE_ORDER_NAMES  # noqa: E402
     from body_retarget.grad_fit_robot import get_joint_global_rot        # noqa: E402
-    from fromw1_g1_21dof_config import G121DOFConfig                    # noqa: E402
+    from hml_phys.g1_21dof_config import G121DOFConfig                  # noqa: E402
 
     device = torch.device(args.device)
     cfg = G121DOFConfig(str(xml), SMPL_BONE_ORDER_NAMES)
