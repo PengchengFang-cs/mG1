@@ -1,4 +1,4 @@
-"""Training windows for route A (docs/07 §21): the policy window plus the three state sequences whose frozen-VAE
+"""Training windows for the MIND-style intent arch (docs/07 §21): the policy window plus the three state sequences whose frozen-VAE
 encodings are MIND's intents.
 
 One item =

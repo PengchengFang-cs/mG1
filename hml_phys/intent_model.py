@@ -1,4 +1,4 @@
-"""Route A (docs/07 §21): MIND's multi-scale intent mechanism on top of the part-structured policy.
+"""MIND intent arch (docs/07 §21): MIND's multi-scale intent mechanism on top of the part-structured policy.
 
   TextAdapter : CLIP ViT-L/14 word features -> 2-layer Transformer encoder (MIND's "lightweight text adapter"),
                 shared by HIP and IIP.
@@ -120,7 +120,7 @@ class IntentPolicy(nn.Module):
         self.iip = IntentDiT(intent_dim, intent_heads, intent_depth, intent_mlp, prefix=True, n_scalar=2, mem_extra=1)
         self.policy = PartPhysPolicyDiT(**policy_kw)
         H = self.policy.hidden_dim
-        assert self.policy.text_mode == "sentence_xattn", "route A builds on the v5 policy (docs/07 §21.5)"
+        assert self.policy.text_mode == "sentence_xattn", "the intent arch builds on the v5 policy (docs/07 §21.5)"
         self.hol_proj = nn.Sequential(nn.LayerNorm(intent_dim), nn.Linear(intent_dim, H))
         self.imm_proj = nn.Sequential(nn.LayerNorm(intent_dim), nn.Linear(intent_dim, H))
         self.intent_type = nn.Parameter(torch.zeros(2, H))

@@ -1,4 +1,4 @@
-"""Route A offline probe (docs/07 §21.5): how much do the executed actions depend on text, on the intents, on the
+"""MIND intent arch, offline probe (docs/07 §21.5): how much do the executed actions depend on text, on the intents, on the
 sparse history, versus the sampling noise? One pass, fixed test windows, t = 0.5, no rollout.
 
   no_text      : CLIP('') for the adapter AND the policy (intents recomputed from the empty text)

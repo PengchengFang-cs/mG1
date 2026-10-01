@@ -50,11 +50,15 @@ Figure 9 的训练递进复现不了 —— teacher 未发布。
 | `fromw1_eval_g1_policy.py` | 跑 G1 跟踪策略并出 MPJPE/SR，绕开未发布的 teacher |
 | `fromw1_eval_chain.sh` | 上述串成一条链，任一级失败即中止 |
 
-## 3. 方法侧成果：线 1（SMPL 仿真角色）
+## 3. MIND 线（SMPL 仿真角色）—— 复现成功，是我们本地最好的一条
 
-连续动作流模型（相对 VQ 离散码本的对照胜出，NOTES 2026-09-23）。
+**MIND（arXiv 2605.26006）的意图机制在本地复现成功**：冻结的 intent VAE + HIP（文本→整体隐变量）
++ IIP（文本+历史+HIP），送进策略的是隐状态而非隐变量；条件增强训练 s~U(0.5,1)、测试 0.75。
+实现在 `hml_phys/intent_{vae,model,flow,data,policy_data}.py`，训练入口
+`scripts/hml_phys/train_intent_{vae,policy}.py`。
+
 **形态是 PHC/UniPhys 的仿真 SMPL 角色（69 维动作、24 关节），不是 G1，上不了真机。**
-价值在于方法与消融结论，不在于可部署性。
+MIND 自己也是这个形态。价值在方法与消融结论。
 
 ### 当前最好（截断摔倒口径，HumanML3D 测试集全集 4646，单次 rollout、单次计算）
 
@@ -76,33 +80,28 @@ R@1 0.410 / FID 3.51 / Duration 0.760 / 摔倒 24.2%。
   同步数同旋钮干净对照下 R@1 +0.0223、FID −0.240
 - 窗口定为 20 帧（16 密集 + 4 未来），与 MIND 的历史结构一致
 
-## 4. 已删除 / 作废，不得再引用
+## 4. 仓库只保留两条线（2026-10-01，用户命令，永久）
 
-| 东西 | 处置 | 理由 |
+**只有 MIND 线（§3）和 FRoM-W1 线（§2）可以存在于代码与文档中。其余一切只允许出现在
+`NOTES.md` 与 `logs/` 的历史记录里，不得作为现状、对照、锚点或「一条线」被引用。**
+
+### 已删除（2026-10-01，共释放约 44 GB）
+
+| 类别 | 内容 | 理由 |
 |---|---|---|
-| ADAPT（arXiv 2609.00677）全部产物 | **已删除**（2026-10-01） | CLAUDE.md §5 永久否决。未开源、无人独立验证、我们严格按规格复现 stage 1 只有 0.044 |
-| ADAPT 时代的 G1 实验（`outputs/g1_eval/`、`g1_intent`、`g1_noint` 日志） | **已删除**（2026-10-01） | 评测协议借自 ADAPT，锚点按 §5 作废；20 万步权重已在清磁盘时丢失，数字无法复核 |
-| HumanML3D 物理线的 val 相关产物 | 作废 | CLAUDE.md §1：三划分数据集一律忽略 val |
-| FRoM-W1 生成侧（H-GPT）产物 | 封存保留不推进 | CLAUDE.md §6 |
+| **ADAPT 全部** | `adapt/`、`outputs/adapt_s1_repro/`（2.0 G）、`outputs/adapt_eval/`、`docs/05`、11 个 `scripts/adapt_*` | CLAUDE.md §5 永久否决：未开源、无人独立验证、严格按规格复现 stage 1 只有 0.044 |
+| **G1 端到端线（ADAPT 时代）** | `hml_phys/g1_*.py`、`scripts/hml_phys/g1_*`、`scripts/g1_eval_rollout.py`、`scripts/g1_physical_protocol.py`、`scripts/record_*`、`docs/04`、`outputs/g1_eval/`、`TextOp/`（16 G）、`data/g1_rollouts`（23 G）、`data/g1_motions`（6.1 G） | token 布局与评测协议均来自 ADAPT；权重已丢失，数字无法复核 |
+| **RVQ / 码本线** | `hml_phys/{rvq,rvq_data,codeflow,codeflow_data,codeflow_flow}.py`、对应训练与评测脚本、`docs/08`、`vendor_momask/` | 已有干净对照证明结论是错的：物理闭环控制任务上用 VQ 离散码替代连续动作更差 |
+| **别人工作的 vendor 克隆** | `vendor_ardy`（SCRIPT）、`vendor_closd`、`vendor_kimodo`、`vendor_moge_umo` | 不属于我们两条线 |
+| HumanML3D 物理线的 val 产物 | — | CLAUDE.md §1：三划分数据集一律忽略 val |
 
-## 4b. 改名与保留（2026-10-01）
+`hml_phys/mc_rollout.py` 里的 codeflow 分支已一并剥除，16 个 MIND 线模块导入全部通过。
+代码与脚本里的 `route A` 字样已全部改为其实际身份（MIND intent arch）—— 那个名字源自 ADAPT 时代。
 
-删 ADAPT 时带出的连锁问题，一并处理掉，**不要再被名字误导**：
+### 封存但保留
 
-| 原名 | 现名 | 说明 |
-|---|---|---|
-| `scripts/adapt_eval_protocol.py` | **`scripts/g1_physical_protocol.py`** | 我们自己的 G1 物理 rollout 评测台（接触判据摔倒、式 S10/S11、冻结参考）。名字里原来带 adapt，内容不是 ADAPT 的 |
-| `scripts/hml_phys/adapt_prompt_pool.py` | **`scripts/hml_phys/g1_prompt_pool.py`** | |
-| `data/adapt_{prompt_pool_130,eval_prompts,motion_whitelist_*}.txt` | **`data/g1_*.txt`** | |
-| — | **`hml_phys/babel_labels.py`**（新建） | `clean_label` / `labels_overlapping` 从被删的 `adapt/data.py` 取回。纯标签处理，我们的 G1 代码在用 |
-
-**保留的 G1 端到端生成代码**（§1 的核心目标，目前唯一的实现）：
-`hml_phys/g1_{data,model,to_smpl}.py`、`hml_phys/babel_labels.py`、
-`scripts/g1_eval_rollout.py`、`scripts/hml_phys/g1_*.py`（8 个）。
-
-**两条已失效的代码路径**，误用会立刻报错并指向替代方案：
-`g1_physical_protocol.py --source policy` 与 `record_tracker_rollouts.py --policy_ckpt`
-都依赖已删的 ADAPT `DiffusionPolicy`。我们自己的策略用 `scripts/g1_eval_rollout.py` 评。
+FRoM-W1 **生成侧**（H-GPT）产物：`scripts/fromw1_{gen,merge_lora,score_rprec}.py`、`configs_fromw1/`、
+`outputs/fromw1/results/`、`docs/09` §5.1。按 CLAUDE.md §6 不再推进、不再汇报。
 
 ## 5. 下一步（待定）
 

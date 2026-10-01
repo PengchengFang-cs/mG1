@@ -151,7 +151,7 @@ class PartPhysPolicyDiT(nn.Module):
             else:                                                                            # xattn_only: no joint text
                 tokens = z.new_zeros(B, 0, self.hidden_dim)
             pad = torch.zeros(B, tokens.shape[1], dtype=torch.bool, device=z.device)
-            if extra_tokens is not None:   # route A: intent tokens join the joint-attention text stream (docs/07 §21)
+            if extra_tokens is not None:   # intent arch: intent tokens join the joint-attention text stream (docs/07 §21)
                 tokens = torch.cat([tokens, extra_tokens.to(dtype)], 1)
                 pad = torch.cat([pad, ~extra_valid.bool()], 1)
             cond = self.timestep_embed(t.float()).to(dtype) + self.scalar_embed(scalars.to(dtype))

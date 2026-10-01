@@ -1,4 +1,4 @@
-"""Flow utilities for route A (docs/07 §21). Same conventions as hml_phys/flow.py (t = 1 clean, x0 prediction,
+"""Flow utilities for the MIND-style intent arch (docs/07 §21). Same conventions as hml_phys/flow.py (t = 1 clean, x0 prediction,
 velocity-space loss, Euler on an ascending grid, x0-space CFG).
 
 Action-only policy: the policy token keeps its 435 channels, but in the future rows only the 69 action channels are

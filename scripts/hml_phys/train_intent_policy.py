@@ -1,4 +1,4 @@
-"""Route A (docs/07 §21): joint end-to-end training of HIP + IIP + the action-only policy on frozen intent-VAE latents.
+"""MIND intent arch (docs/07 §21): joint end-to-end training of HIP + IIP + the action-only policy on frozen intent-VAE latents.
 
   L = L_HIP + L_IIP + L_ADiT   (MIND eq. 5, equal weights)
   HIP : text -> holistic intent latents (4 x 32)
