@@ -25,6 +25,8 @@ vendor_moge_umo/
 vendor_mogeflow/
 vendor_momask/
 .aris/
-external/
+# third-party clones stay on the cluster, but the record of what we changed inside them must not
+external/*
+!external/VENDOR_PATCHES.md
 vendor_motionstreamer/
 *.bak

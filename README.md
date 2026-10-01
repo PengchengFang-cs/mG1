@@ -1,7 +1,11 @@
 # mG1 — text-driven physics-based humanoid control
 
 Working repository for a text-conditioned physics policy on the **sim-character HumanML3D benchmark**
-(SMPL humanoid in Isaac Gym, PULSE low-level control), plus the earlier G1 / ADAPT line.
+(SMPL humanoid in Isaac Gym, PULSE low-level control) and on end-to-end action generation for the
+Unitree G1, which is the project's core goal.
+
+**Start at `STATUS.md`** -- it is the single source of truth for current progress and best results.
+`NOTES.md` is an append-only log and is not a statement of current state.
 
 Everything here is code and documentation. Data, checkpoints, logs and third-party clones stay on the cluster
 (see `.gitignore`).

@@ -1,6 +1,6 @@
 """Closed-loop evaluation of a G1 text policy in the TextOp Isaac Lab environment (docs/04 line A).
 
-Protocol is ADAPT's Table 1, kept identical to `scripts/adapt_eval_protocol.py` so the physical numbers stay
+Protocol is ADAPT's Table 1, kept identical to `scripts/g1_physical_protocol.py` so the physical numbers stay
 comparable: N rollouts of 20 s (1000 steps @50 Hz) with the prompt switched every 5-10 s, fall = any body other
 than the ankle/wrist links below `--contact_z` or the root tipped past 60 degrees, plus action smoothness,
 transition smoothness and foot sliding.
@@ -41,9 +41,13 @@ parser.add_argument("--source", default="policy", choices=["policy", "tracker", 
 parser.add_argument("--ckpt", default="", help="our policy checkpoint (required for --source policy)")
 parser.add_argument("--weights", default="ema", choices=["ema", "model"])
 parser.add_argument("--text_npz", default=os.path.join(ROOT, "data/g1_rollouts/g1_eval_text_clip.npz"))
-parser.add_argument("--prompt_file", default=os.path.join(ROOT, "data/adapt_eval_prompts.txt"))
+parser.add_argument("--prompt_file", default=os.path.join(ROOT, "data/g1_eval_prompts.txt"))
 parser.add_argument("--stats", default=os.path.join(ROOT, "data/g1_rollouts/g1_token_stats.npz"))
 parser.add_argument("--motion_glob", default="artifacts/val_all/*/motion.npz")
+parser.add_argument("--motion_list", default="",
+                    help="a whitelist of motion names (one per line, from g1_prompt_pool.py). ADAPT's pool "
+                         "covers locomotion / exercises / upper-body gestures only, and a contact-based fall "
+                         "criterion is meaningless on sitting or crawling, where torso contact is correct.")
 parser.add_argument("--resume_path", default="logs/rsl_rl/Pretrained/checkpoints/model_75000.pt",
                     help="the pretrained TextOp tracker, for --source tracker and the warm-up")
 parser.add_argument("--warmup_source", default="tracker", choices=["tracker", "hold"],
@@ -65,7 +69,14 @@ parser.add_argument("--shadow_bug", default="none", choices=["none", "pairing", 
                     help="deliberately reintroduce one of the two harness bugs, for the SHADOW policy only, "
                          "to price what each one cost: 'pairing' pushes (state AFTER the step, action), "
                          "'rowh' hides the current state from the first generated row. Diagnostic only.")
-parser.add_argument("--contact_z", type=float, default=0.06)
+parser.add_argument("--fall_mode", default="contact", choices=["contact", "height"],
+                    help="ADAPT terminates on illegal torso contact (paper Appendix C), which is what "
+                         "'contact' reproduces. 'height' is our earlier proxy, kept only to re-measure the gap.")
+parser.add_argument("--fall_bodies", default="pelvis,waist_yaw_link,waist_roll_link,torso_link",
+                    help="bodies whose ground contact counts as a fall, for --fall_mode contact")
+parser.add_argument("--fall_force", type=float, default=1.0,
+                    help="contact force (N) over the sensor's history that counts as contact")
+parser.add_argument("--contact_z", type=float, default=0.06, help="only used by --fall_mode height")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--out", required=True)
 cli_args.add_rsl_rl_args(parser)
@@ -259,7 +270,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     torch.manual_seed(args_cli.seed); np.random.seed(args_cli.seed)
     N = args_cli.num_envs
     env_cfg.scene.num_envs = N
-    env_cfg.commands.motion.motion_files = sorted(glob.glob(args_cli.motion_glob))
+    motion_files = sorted(glob.glob(args_cli.motion_glob))
+    if args_cli.motion_list:
+        keep = {l.strip() for l in open(args_cli.motion_list) if l.strip()}
+        n0 = len(motion_files)
+        motion_files = [f for f in motion_files if os.path.basename(os.path.dirname(f)) in keep]
+        print(f"[eval] motion whitelist {args_cli.motion_list}: {len(motion_files)}/{n0} motions")
+        assert motion_files, "the whitelist matched no motion under --motion_glob"
+    env_cfg.commands.motion.motion_files = motion_files
     env_cfg.commands.motion.start_from_zero_step = True
     env_cfg.commands.motion.enable_adaptive_sampling = False
     env_cfg.commands.motion.pose_range = {}; env_cfg.commands.motion.velocity_range = {}
@@ -284,7 +302,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
 
     bad = torch.tensor([i for i, n in enumerate(body_names) if not ("ankle" in n or "wrist" in n)], device=dev)
     feet = torch.tensor([i for i, n in enumerate(body_names) if "ankle_roll" in n], device=dev)
-    print(f"[eval] {len(body_names)} bodies, {len(bad)} bad-contact, {len(feet)} feet; source={args_cli.source}")
+    # ADAPT's criteria are contact-based (Appendix C: "illegal torso contact"; Eq. S11: peak contact force > 1 N
+    # over a short history). The tracker scene already carries a ContactSensor over every robot body.
+    csensor = uenv.scene.sensors.get("contact_forces") if hasattr(uenv.scene, "sensors") else None
+    fall_names = [n.strip() for n in args_cli.fall_bodies.split(",") if n.strip()]
+    fall_ids = torch.tensor([body_names.index(n) for n in fall_names if n in body_names], device=dev)
+    if args_cli.fall_mode == "contact":
+        assert csensor is not None, "the scene has no 'contact_forces' sensor; use --fall_mode height"
+        assert len(fall_ids) == len(fall_names), f"unknown bodies in --fall_bodies: {fall_names}"
+        # the sensor is created over Robot/.* in prim order, which need not equal robot.body_names order
+        sensor_names = list(getattr(csensor, "body_names", body_names))
+        s_fall = torch.tensor([sensor_names.index(n) for n in fall_names], device=dev)
+        # keep the sensor's foot order identical to `feet` (robot body order), or the contact indicator of one
+        # foot would be paired with the velocity of the other
+        s_feet = torch.tensor([sensor_names.index(body_names[i]) for i in feet.tolist()], device=dev)
+        assert len(s_feet) == 2, f"expected 2 ankle_roll links in the contact sensor, got {len(s_feet)}"
+    else:
+        s_fall = s_feet = None
+
+    def contact_peak(ids):
+        """peak |force| over the sensor's history window, per body -- the indicator of Eq. S11."""
+        return csensor.data.net_forces_w_history[:, :, ids, :].norm(dim=-1).max(dim=1)[0]
+
+    print(f"[eval] {len(body_names)} bodies; fall={args_cli.fall_mode} "
+          f"({fall_names if args_cli.fall_mode == 'contact' else f'{len(bad)} bodies below {args_cli.contact_z} m'}); "
+          f"source={args_cli.source}")
 
     prompts = [l.strip() for l in open(args_cli.prompt_file) if l.strip()]
     bank = TextBank(args_cli.text_npz, dev)
@@ -448,10 +490,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
             obs, _, _, _ = env.step(a)
             bp = d.body_pos_w - uenv.scene.env_origins[:, None]
             rec_bp.append(bp.to(torch.float16).cpu().numpy())
-            z = bp[:, :, 2]
-            newly = (~fallen) & ((z[:, bad] < args_cli.contact_z).any(-1) | (d.projected_gravity_b[:, 2] > -0.5))
+            if args_cli.fall_mode == "contact":
+                newly = (~fallen) & (contact_peak(s_fall) > args_cli.fall_force).any(-1)
+                contact = (contact_peak(s_feet) > 1.0) & (~fallen)[:, None]     # Eq. S11: peak force > 1 N
+            else:
+                z = bp[:, :, 2]
+                newly = (~fallen) & ((z[:, bad] < args_cli.contact_z).any(-1) | (d.projected_gravity_b[:, 2] > -0.5))
+                contact = (bp[:, feet, 2] < args_cli.contact_z) & (~fallen)[:, None]
             fall_step[newly] = step; fallen |= newly
-            contact = (z[:, feet] < args_cli.contact_z) & (~fallen)[:, None]
             sl_sum += (d.body_lin_vel_w[:, feet, :2].norm(dim=-1) * contact).sum(-1); sl_n += contact.sum(-1)
             if step % 250 == 0:
                 print(f"[eval] batch {b+1}/{n_batches} step {step} fallen {int(fallen.sum())}/{N} "
@@ -496,6 +542,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
            "mean_fall_time_s": (float(np.mean(tot["fall_steps"])) / fps) if tot["fall_steps"] else None,
            "plan_ms": float(np.mean(infer)) if infer else None, "prompts": len(prompts),
            "steps": args_cli.steps, "num_steps": args_cli.num_steps, "cfg": args_cli.cfg, "K": args_cli.K,
+           "fall_mode": args_cli.fall_mode, "fall_bodies": args_cli.fall_bodies,
            "contact_z": args_cli.contact_z, "seed": args_cli.seed}
     if shadow is not None:
         # 0 = the policy reproduces the tracker exactly, 1 = no better than always predicting the mean action

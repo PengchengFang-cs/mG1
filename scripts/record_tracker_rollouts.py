@@ -26,6 +26,22 @@ parser.add_argument("--meta_pkl", type=str, default=None, help="name->{feat_p, f
 parser.add_argument("--out", type=str, required=True, help="output .pkl path")
 parser.add_argument("--repeats", type=int, default=1, help="rollouts per motion")
 parser.add_argument("--keep_pushes", action="store_true")
+parser.add_argument("--clean_obs", type=int, default=1,
+                    help="disable the tracker's observation corruption during recording; see the comment "
+                         "where it is applied")
+parser.add_argument("--no_dr", type=int, default=0,
+                    help="disable every randomisation term, so the recorded dynamics are reproducible and a "
+                         "recorded action sequence can be replayed exactly (scripts/adapt_replay_check.py)")
+parser.add_argument("--dr_mode", default="startup", choices=["startup", "rollout"],
+                    help="'startup' (the TextOp default) draws the randomisation ONCE per env at scene "
+                         "creation, so a 6195-motion corpus collected with 256 envs contains only 256 "
+                         "dynamics configurations and each env's draw is confounded with which motions it "
+                         "happened to be handed. 'rollout' re-draws at every rollout boundary, which is what "
+                         "'increase state coverage' (ADAPT Appendix A) needs.")
+parser.add_argument("--actuator_dr", type=int, default=1,
+                    help="add ADAPT Table S4's actuator-gain randomisation, which the TextOp EventCfg lacks")
+parser.add_argument("--stiffness_range", type=float, nargs=2, default=[0.75, 1.25])
+parser.add_argument("--damping_range", type=float, nargs=2, default=[0.75, 1.25])
 parser.add_argument("--max_steps", type=int, default=200000)
 parser.add_argument("--save_every", type=int, default=300, help="write a partial pkl every N finished rollouts (crash safety)")
 # DAgger: execute the diffusion policy's action with probability --mix_prob per step, always record the tracker's
@@ -69,8 +85,53 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     env_cfg.commands.motion.velocity_range = {}
     env_cfg.commands.motion.joint_position_range = (0.0, 0.0)
     env_cfg.episode_length_s = 600.0
+    if args_cli.clean_obs:
+        # `ProjGravObservationsCfg.PolicyCfg.__post_init__` sets enable_corruption=True (base_lin_vel +-0.5 m/s,
+        # joint_vel +-0.5 rad/s, base_ang_vel +-0.2, projected_gravity +-0.07, motion_anchor_pos_b +-0.25).
+        # With it on, the tracker acts on a NOISY observation while we store the CLEAN state, so every
+        # behaviour-cloning label is a_t = pi(o_t + noise) recorded against o_t: irreducible label noise in
+        # 100% of targets, which floors the denoising loss and smears the conditional action distribution.
+        env_cfg.observations.policy.enable_corruption = False
+        print("[rec] observation corruption OFF (labels match the stored state)")
     if not args_cli.keep_pushes:
         env_cfg.events.push_robot = None
+    # base_com stays at startup: TextOp's randomize_rigid_body_com writes `coms[:, body_ids] += rand_samples`
+    # with `coms` covering every env, so it only works when env_ids is all of them. Physically that is also
+    # the most defensible split -- the torso centre of mass is a per-robot constant, while ground friction,
+    # joint calibration drift and actuator gains are what should vary between episodes.
+    if args_cli.no_dr:
+        for _n in ("physics_material", "add_joint_default_pos", "base_com"):
+            if getattr(env_cfg.events, _n, None) is not None:
+                setattr(env_cfg.events, _n, None)
+        args_cli.actuator_dr = 0
+        print("[rec] ALL randomisation off (reproducible dynamics)")
+    dr_terms = ["physics_material", "add_joint_default_pos"] + (["actuator_gains"] if args_cli.actuator_dr else [])
+    if args_cli.dr_mode == "rollout":
+        for _n in dr_terms:
+            _t = getattr(env_cfg.events, _n, None)
+            if _t is not None:
+                _t.mode = "reset"
+        print(f"[rec] domain randomisation re-drawn per rollout: {dr_terms}")
+    if args_cli.actuator_dr:
+        # ADAPT Table S4 randomises actuator dynamics during data collection; the TextOp EventCfg already
+        # carries the other five quantities (friction, restitution, joint default offset, torso CoM) at the
+        # same ranges, but has no actuator term at all. Added here so the collected data covers the
+        # stiffness/damping variation the paper relies on -- it is the category that matters most for a
+        # PD-controlled robot, where the policy emits joint targets and the gains decide the torque.
+        from isaaclab.managers import EventTermCfg as _EventTerm, SceneEntityCfg
+        from isaaclab.envs import mdp as _mdp
+        env_cfg.events.actuator_gains = _EventTerm(
+            func=_mdp.randomize_actuator_gains,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+                "stiffness_distribution_params": tuple(args_cli.stiffness_range),
+                "damping_distribution_params": tuple(args_cli.damping_range),
+                "operation": "scale",
+            },
+        )
+        print(f"[rec] actuator DR on: stiffness x{tuple(args_cli.stiffness_range)} "
+              f"damping x{tuple(args_cli.damping_range)}")
     meta = joblib.load(args_cli.meta_pkl) if args_cli.meta_pkl else {}
 
     env = gym.make(args_cli.task, cfg=env_cfg)
@@ -116,8 +177,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     # ---- optional DAgger policy ----
     dpol, emb_dict, cur_text = None, None, None
     if args_cli.policy_ckpt:
-        from adapt.policy import DiffusionPolicy, build_obs_torch
-        from adapt.data import labels_overlapping
+        # ADAPT's DAgger policy was deleted on 2026-10-01 (CLAUDE.md §5, STATUS.md §4); recording
+        # tracker rollouts without --policy_ckpt is unaffected.
+        raise SystemExit(
+            "--policy_ckpt needed ADAPT's DiffusionPolicy, deleted 2026-10-01 "
+            "(CLAUDE.md §5, STATUS.md §4). Record tracker rollouts without --policy_ckpt."
+        )
+        from hml_phys.babel_labels import labels_overlapping
         dpol = DiffusionPolicy(args_cli.policy_ckpt, device=str(uenv.device), steps=args_cli.policy_ddim, guidance=args_cli.policy_guidance, stab_level=args_cli.policy_stab)
         dpol.reset(N)
         emb_dict = joblib.load(args_cli.text_dict)
@@ -152,6 +218,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     for i in range(N): start(i)
 
     prev_action = torch.zeros(N, robot.num_joints, device=uenv.device)
+    boundary = torch.zeros(N, dtype=torch.bool, device=uenv.device)
+    if args_cli.dr_mode == "rollout":
+        uenv.event_manager.apply(mode="reset", env_ids=torch.arange(N, device=uenv.device),
+                                 global_env_step_count=0)   # first draw
     t0 = time.time(); step = 0
     while step < args_cli.max_steps and not bool(state["idle"].all()):
         with torch.inference_mode():
@@ -187,17 +257,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
             b["action"].append(actions[i].cpu().numpy()); b["expert_action"].append(expert[i].cpu().numpy()); b["by_policy"].append(bool(by_pol[i]))
             b["joint_target"].append(tgt[i].cpu().numpy())
             b["root_state"].append(root_state[i].cpu().numpy()); b["ref_t"].append(int(ref_t_c[i]))
-            if terminated[i]:
+            # completion wins over termination: a rollout that executes its last reference frame AND trips a
+            # termination on the same step did finish the motion, and scoring it as a failure silently threw
+            # those motions out of an only_success dataset
+            if ref_t_c[i] >= int(mlen[i]) - 1:     # last reference frame executed -> motion complete
+                finish(i, True)
+            elif terminated[i]:
                 if len(b["action"]) <= 2:
                     fired = [n for n in tm.active_terms if bool(tm.get_term(n)[i])]
                     print(f"[rec] early termination env {i} T={len(b['action'])} ref_t={int(ref_t_c[i])} terms={fired}")
                 finish(i, False)
-            elif ref_t_c[i] >= int(mlen[i]) - 1:   # last reference frame executed -> motion complete
-                finish(i, True)
             if active[i] is None and not state["idle"][i]:
-                start(i)
+                start(i); boundary[i] = True
+        if args_cli.dr_mode == "rollout" and bool(boundary.any()):
+            # a completed motion resamples the reference INSIDE command_manager.compute() with no env reset,
+            # so reset-mode events would never fire at that boundary; apply them by hand for those envs
+            uenv.event_manager.apply(mode="reset", env_ids=torch.where(boundary)[0],
+                                     global_env_step_count=int(uenv.common_step_counter))
         prev_action = actions.clone()
+        # Clear prev_action at EVERY rollout boundary, not just on failure. On motion completion the command
+        # term resamples and teleports the robot inside command_manager.compute() with no env reset, so the
+        # old action survived into the new rollout: measured 80% of recorded rollouts began with a non-zero
+        # prev_action (median |max| 2.24) paired with a freshly teleported pose -- a state the closed-loop
+        # policy, which resets its buffer to zero, never reproduces.
         prev_action[terminated.to(uenv.device)] = 0.0
+        prev_action[boundary] = 0.0
+        boundary[:] = False
         step += 1
         if step % 500 == 0:
             print(f"[rec] step {step}  rollouts {len(rollouts)}  queue {len(state['queue'])}  {time.time()-t0:.0f}s")

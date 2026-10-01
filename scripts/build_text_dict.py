@@ -2,7 +2,7 @@
 import sys, os, glob, joblib, numpy as np, torch
 ROOT = "/iridisfs/scratch/pf2m24/projects/motion_rebot"
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.join(ROOT, "UniPhys"))
-from adapt.data import clean_label
+from hml_phys.babel_labels import clean_label
 from uniphys.utils.clip_utils import load_and_freeze_clip, encode_text
 src = os.path.join(ROOT, "UniPhys/data/babel_state-action-text-pairs/text_embedding_dict_clip.pkl")
 dst = os.path.join(ROOT, "data/text_embedding_dict_clip_merged.pkl")

@@ -16,7 +16,7 @@ sys.path.insert(0, "/iridisfs/scratch/pf2m24/projects/motion_rebot")
 from hml_phys.text_clip import ClipText
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--prompts", default="data/adapt_eval_prompts.txt")
+ap.add_argument("--prompts", default="data/g1_eval_prompts.txt")
 ap.add_argument("--extra", nargs="*", default=[], help="further captions to include (e.g. BABEL labels)")
 ap.add_argument("--babel_labels", default="", help="optional pkl of G1 rollouts; adds every BABEL label seen")
 ap.add_argument("--meta_pkl", default="", help="optional motion meta pkl (name -> frame_ann); adds its labels. "
