@@ -1,0 +1,13 @@
+# Local asset paths for the FRoM-W1 reproduction. The vendored repo is left untouched; this points the
+# config loader at our copy of configs/archs, where the language model path and the LoRA flag are changed.
+CONFIG_FOLDER: /iridisfs/scratch/pf2m24/projects/motion_rebot/configs_fromw1
+ARCHS_FOLDER: /iridisfs/scratch/pf2m24/projects/motion_rebot/configs_fromw1/archs
+
+FOLDER: /iridisfs/scratch/pf2m24/projects/motion_rebot/outputs/fromw1
+
+TEST:
+  FOLDER: /iridisfs/scratch/pf2m24/projects/motion_rebot/outputs/fromw1/results
+
+DEMO:
+  TASK: t2m
+  EXAMPLE: /iridisfs/scratch/pf2m24/projects/motion_rebot/data/adapt_prompt_pool_130.txt

@@ -6,7 +6,10 @@
 #   Nucleus assets and registry extensions over it). Pass --offline to skip the tunnel.
 module load apptainer/1.4.0 >/dev/null 2>&1
 SB=/iridisfs/scratch/pf2m24/containers/isaaclab_2.1.0.sandbox
-CHOME=/iridisfs/scratch/pf2m24/isaaclab_home
+# Kit writes its data/logs/shader cache into HOME. Two containers sharing one HOME corrupt each other's cache
+# and the second one dies with "A GPU crash occurred / VkResult: ERROR_DEVICE_LOST" (seen 2026-09-26 running
+# two recorders on one node). Set ISAACLAB_HOME_TAG to give a run its own directory.
+CHOME=/iridisfs/scratch/pf2m24/isaaclab_home${ISAACLAB_HOME_TAG:+_$ISAACLAB_HOME_TAG}
 mkdir -p $CHOME/kit_data $CHOME/kit_logs $CHOME/kit_cache
 MODE=""; OFFLINE=0
 while [[ "$1" == --* ]]; do
