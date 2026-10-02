@@ -27,7 +27,10 @@ def main():
 
     summary = {}
     for split in args.splits.split(","):
-        shards = sorted(d.glob(f"refs_{split}_shard*.pkl"))
+        # The builder writes a sibling `<stem>.skipped.pkl` next to each shard; a bare *.pkl glob picks
+        # those up and then looks for a .text.json that was never written for them.
+        shards = sorted(q for q in d.glob(f"refs_{split}_shard*.pkl")
+                        if not q.name.endswith(".skipped.pkl"))
         assert shards, f"no shards for {split} in {d}"
         lib, text = {}, {}
         for s in shards:
