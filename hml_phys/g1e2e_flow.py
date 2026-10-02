@@ -26,8 +26,13 @@ def action_channel_mask(device):
     return m
 
 
-def generated_elements(observed_mask, act_mask, valid=None):
-    """[B,T,72] float: 1 where the policy generates -- future rows x action channels."""
+def generated_elements(observed_mask, valid, act_mask):
+    """[B,T,72] float: 1 where the policy generates -- future rows x action channels.
+
+    Argument order matches intent_flow.generated_elements deliberately. Anyone writing a G1 sampler by
+    copying a reference call site would otherwise pass `valid` where `act_mask` is expected and get a
+    silently wrong mask instead of an error. `valid` may be None when every row is valid.
+    """
     fut = 1.0 - observed_mask
     if valid is not None:
         fut = fut * valid
@@ -54,9 +59,16 @@ def build_state_elem(x0, gen, t, noise=None, generator=None):
 
 
 def velocity_pair(x0_hat, x0, z, t, v_eps=0.05):
-    """Same as flow.velocity_pair: compare velocities rather than x0, with t floored at v_eps."""
-    tb = t[:, None, None].clamp_min(v_eps)
-    return (x0_hat - z) / (1.0 - tb + 1e-8), (x0 - z) / (1.0 - tb + 1e-8)
+    """Same as flow.velocity_pair and intent_flow.velocity_pair: compare velocities rather than x0.
+
+    The DENOMINATOR is floored, not t. Flooring t instead leaves 1/(1-t) unbounded: at t -> 1-1e-4 the
+    denominator reaches 1e-4, a 500x velocity inflation and 2.5e5x on the squared error for that sample.
+    With the logit-normal default (p_mean -0.8) the largest t drawn in 200k samples was 0.949, so the two
+    forms differ by at most 1.04x here -- but `dist="uniform"` or a positive p_mean puts ~5% of samples
+    past 0.95 and the difference becomes severe. Bounded at 1/v_eps = 20, as the reference is.
+    """
+    denom = (1.0 - t[:, None, None]).clamp_min(v_eps)
+    return (x0_hat - z) / denom, (x0 - z) / denom
 
 
 def policy_loss(v_hat, v, gen):

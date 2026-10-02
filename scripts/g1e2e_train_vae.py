@@ -74,7 +74,9 @@ def main():
     model = IntentVAE(input_dim=PROPRIO_DIM, width=args.width, down_t=args.down_t, stride_t=2,
                       depth=args.depth, dilation_growth_rate=args.dilation, latent_dim=args.latent).to(dev)
     print(f"IntentVAE {model.num_params() / 1e6:.1f} M params, input_dim {PROPRIO_DIM}")
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    # weight_decay 0 and betas (0.9, 0.99), as MotionStreamer and the reference use; AdamW's default
+    # 0.01 would shrink a frozen feature extractor's weights for no reason.
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0, betas=(0.9, 0.99))
 
     def loader(ds, shuffle):
         return DataLoader(ds, batch_size=args.batch, shuffle=shuffle, num_workers=2,
@@ -102,8 +104,12 @@ def main():
                 break
             x = b["x"].to(dev)
             xr, mu, lv = model(x)
-            rec = sigma_vae_nll(xr, x) / x.numel()
-            kl = (-0.5 * (1 + lv - mu ** 2 - lv.exp())).sum(-1).mean()
+            # Both terms on the reference's footing (train_intent_vae.py:128-130): the summed NLL
+            # against a KL summed over (latent time, latent dim) and meaned over the batch only.
+            # Dividing the NLL per element while meaning the KL over latent time rescaled their ratio by
+            # B*T*C/T' = 26112, so `--kl 1e-5` stopped meaning MIND's lambda_KL = 1e-5 at all.
+            rec = sigma_vae_nll(xr, x) / x.shape[0]
+            kl = (-0.5 * (1 + lv - mu ** 2 - lv.exp())).sum([1, 2]).mean()
             loss = rec + args.kl * kl
             opt.zero_grad()
             loss.backward()
@@ -111,7 +117,14 @@ def main():
             opt.step()
             step += 1
             if step % args.log_every == 0:
+                with torch.no_grad():
+                    # mu_abs / mu_std / active show whether the posterior is informative and at what
+                    # scale, which stage 2's flow matching depends on (it mixes the latent with N(0,1)).
+                    mu_abs = float(mu.abs().mean())
+                    mu_std = float(mu.reshape(-1, mu.shape[-1]).std(0).mean())
+                    active = int((mu.reshape(-1, mu.shape[-1]).std(0) > 0.1).sum())
                 print(f"step {step} loss={float(loss):.4f} rec={float(rec):.4f} kl={float(kl):.2f} "
+                      f"mu_abs={mu_abs:.3f} mu_std={mu_std:.3f} active={active}/{mu.shape[-1]} "
                       f"{(time.time() - t0) / step * 1000:.0f}ms/it", flush=True)
             if step % args.eval_every == 0 or step == args.steps:
                 e_rec, e_kl = evaluate()

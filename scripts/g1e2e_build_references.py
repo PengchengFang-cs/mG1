@@ -112,11 +112,18 @@ def main():
         fr = float(fr)
 
         trim = HEAD_TRIM_20FPS.get(c["source_file"].split("/")[2], 0)
-        t_start = (c["start"] + trim) / HML_FPS
-        t_end = (c["end"] + trim) / HML_FPS
+        # HumanML3D strides the raw file by an INTEGER down_sample = int(fps/20) before applying the head
+        # trim and index.csv, so its frame m is raw frame m * stride -- not round(m * fps / 20). The two
+        # agree only when fps is a multiple of 20. Verified against HumanML3D's own new_joints root height
+        # on 250 fps clips: stride int(250/20)=12 correlates 1.0000, while 250/20=12.5 gives 0.69 and
+        # worse. 99 train and 13 test clips are affected, by up to 1.09 s, and the 59.99998 fps files
+        # (int(fr/20)=2, i.e. HumanML3D sampled them at 30 fps) were off by a 1.5x time scale.
+        # scripts/hml_phys/03_build_dataset.py uses the /20 form too; it escaped only because it picked
+        # fps_eff per file by content alignment, so it does not validate the assumption.
+        stride = max(1, int(fr / HML_FPS))
         T = raw["poses"].shape[0]
-        j0 = max(0, min(int(round(t_start * fr)), T))
-        j1 = max(j0, min(int(round(t_end * fr)), T))
+        j0 = max(0, min((c["start"] + trim) * stride, T))
+        j1 = max(j0, min((c["end"] + trim) * stride, T))
         if (j1 - j0) / fr < 0.5:            # under half a second of source is not a usable clip
             skipped[c["name"]] = f"crop too short: {j1 - j0} raw frames at {fr:g} fps"
             continue
@@ -128,7 +135,9 @@ def main():
         lib[c["name"]] = entry
         text[c["name"]] = dict(split=c["split"], official_id=c["official_id"],
                                source_file=c["source_file"], captions=[t["caption"] for t in c["texts"]],
-                               n_frames=int(entry["dof"].shape[0]), fit_err_m=entry["fit_err_m"])
+                               n_frames=int(entry["dof"].shape[0]), fit_err_m=entry["fit_err_m"],
+                               fps=float(entry["fps"]), mocap_fps=float(fr), hml_stride=int(stride),
+                               hml_fps_eff=float(fr) / stride)
 
     dt = time.time() - t0
     print(f"\nretargeted {len(lib)} / {len(clips)} in {dt:.0f}s  ({dt / max(1, len(lib)):.1f}s per clip)")

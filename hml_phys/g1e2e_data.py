@@ -23,6 +23,8 @@ dominate every loss. Statistics come from TRAIN ONLY and are reused for test, ne
 import json
 from pathlib import Path
 
+from pathlib import Path
+
 import joblib
 import numpy as np
 import torch
@@ -48,8 +50,11 @@ def compute_stats(rollouts, gen_stride):
     mean = acc_s / acc_n
     var = np.maximum(acc_ss / acc_n - mean ** 2, 0.0)
     std = np.sqrt(var)
-    # A dead channel would otherwise blow up on division; 1e-3 is well below any live channel's spread.
-    std = np.where(std < 1e-3, 1.0, std)
+    # A dead channel would otherwise blow up on division. The threshold has to sit ABOVE the smallest
+    # genuinely-dead channel: projected_gravity[2] measures std 0.00423 on the recorded data (the robot is
+    # upright almost always, so that component is pinned near -1), and a 1e-3 guard let it through to be
+    # amplified ~236x into the network input and weighted equally in the VAE's reconstruction objective.
+    std = np.where(std < 1e-2, 1.0, std)
     return mean.astype(np.float32), std.astype(np.float32), int(acc_n)
 
 
@@ -63,8 +68,8 @@ class G1E2EWindows(Dataset):
     rows show, and it defaults to showing just the first one, the state the loop can actually observe.
     """
 
-    def __init__(self, rollouts_path, text_emb_path, H, F, gen_hz=25, stride=1, stats=None,
-                 obs_future="first", max_clips=0, seed=0):
+    def __init__(self, rollouts_path, text_cache, H, F, gen_hz=25, stride=1, stats=None,
+                 obs_future="first", max_clips=0, seed=0, deterministic_caption=False):
         assert CONTROL_HZ % gen_hz == 0, (
             f"gen_hz must divide the {CONTROL_HZ} Hz recording rate by an integer stride; {gen_hz} does "
             f"not. Available: {[h for h in range(1, CONTROL_HZ + 1) if CONTROL_HZ % h == 0]}. "
@@ -78,10 +83,25 @@ class G1E2EWindows(Dataset):
         if max_clips:
             keys = sorted(roll)[:max_clips]
             roll = {k: roll[k] for k in keys}
-        self.emb = joblib.load(text_emb_path)       # {clip_id: (n_caps, L, D) or (n_caps, D) float32}
+        # Tokens, their per-caption LENGTHS and the CLIP pooled vectors all travel together: a caption's
+        # mask is only correct against its own length, and the pooled vector is the sentence embedding
+        # the policy's cross-attention was designed around (text_mode="sentence_xattn" makes it the only
+        # sentence-level text signal). A mean over the 50 token slots is not that vector.
+        tc = Path(text_cache)
+        self.emb = joblib.load(tc / "tokens.pkl")
+        self.lens = joblib.load(tc / "lengths.pkl")
+        self.pooled = joblib.load(tc / "pooled.pkl")
+        self.deterministic_caption = deterministic_caption
 
+        # The window index is built with H future rows, not F. MIND's immediate intent is the encoding of
+        # the NEXT H state rows (intent_policy_data.py:8, `fut [16,366] future t+1..t+16 -> VAE -> I_I`),
+        # so a window must always have H future rows available even though the policy only generates F of
+        # them -- exactly what the validated version does with `kw["F"] = L_INTENT` and then trims the
+        # policy rows back to F_act. Without this the IIP has no target distinct from its own prefix and
+        # degenerates into an identity map.
         self.clips, self.windows = [], []
-        T = H + F
+        self.F_fut = max(F, H)
+        T = H + self.F_fut
         skipped = 0
         for key, v in sorted(roll.items()):
             if key not in self.emb:
@@ -102,7 +122,6 @@ class G1E2EWindows(Dataset):
         else:
             mean, std = stats
         self.mean, self.std = mean, std
-        self.rng = np.random.default_rng(seed)
 
     def __len__(self):
         return len(self.windows)
@@ -110,15 +129,25 @@ class G1E2EWindows(Dataset):
     def __getitem__(self, i):
         ci, s = self.windows[i]
         c = self.clips[ci]
-        x = (c["tok"][s:s + self.H + self.F] - self.mean) / self.std
-        x = self.mask_future_proprio(x.copy())
+        full = (c["tok"][s:s + self.H + self.F_fut] - self.mean) / self.std
+        # The immediate-intent target: the next H proprio rows, UNMASKED. It reaches the frozen VAE only,
+        # never the policy -- the policy sees `x` below, where the future proprio is zeroed.
+        fut = full[self.H:self.H + self.H, :PROPRIO_DIM].copy()
+        x = self.mask_future_proprio(full[:self.H + self.F].copy())
         caps = self.emb[c["key"]]
-        cap = caps[self.rng.integers(len(caps))] if len(caps) > 1 else caps[0]
+        # Deterministic per-window choice, not a shared RNG: a generator built in __init__ is inherited
+        # identically by every forked worker, so all of them drew the same caption sequence and the
+        # paraphrase augmentation was a quarter as diverse as intended. Deriving the index from the
+        # window also makes the eval split reproducible, which checkpoint selection depends on.
+        j = 0 if self.deterministic_caption else (hash((c["key"], s)) % len(caps))
         progress = (s + self.H) / max(1, c["n"])
         return dict(
             x=torch.from_numpy(x),
+            fut=torch.from_numpy(fut.astype(np.float32)),
             holi=torch.from_numpy(self.holistic(ci)),
-            text=torch.from_numpy(np.asarray(cap, dtype=np.float32)),
+            text=torch.from_numpy(np.asarray(caps[j], dtype=np.float32)),
+            text_len=torch.tensor(int(self.lens[c["key"]][j]), dtype=torch.long),
+            text_pooled=torch.from_numpy(np.asarray(self.pooled[c["key"]][j], dtype=np.float32)),
             scal=torch.tensor([progress, c["n"] / float(self.gen_hz) / 10.0], dtype=torch.float32),
             key=c["key"],
         )
@@ -149,7 +178,7 @@ def describe(ds):
     frames = sum(c["n"] for c in ds.clips)
     return dict(clips=len(ds.clips), windows=len(ds.windows), skipped=ds.n_skipped,
                 frames=frames, minutes=frames / ds.gen_hz / 60.0, gen_hz=ds.gen_hz,
-                H=ds.H, F=ds.F, obs_future=ds.obs_future)
+                H=ds.H, F=ds.F, F_fut=ds.F_fut, obs_future=ds.obs_future)
 
 
 class G1E2EStateSeq(Dataset):
@@ -183,6 +212,11 @@ class G1E2EStateSeq(Dataset):
         self.mean_full, self.std_full = mean, std
         self.mean, self.std = mean[:PROPRIO_DIM], std[:PROPRIO_DIM]
 
+        # Three KINDS of sequence, as the reference VAE trains on (train_intent_vae.py:73,126 uses
+        # KINDS = ("hist", "fut", "holi")): contiguous slices AND the whole clip resampled to L rows.
+        # Stage 2 asks this encoder for the holistic latent, whose rows are ~13 apart (about 0.5 s per
+        # step) -- far outside the distribution of a contiguous slice. Without the holistic kind here,
+        # HIP is trained to regress a latent the encoder was never fit to produce.
         self.clips, self.windows = [], []
         for key, v in sorted(roll.items()):
             p = v["proprio"].astype(np.float32)[::self.gen_stride]
@@ -192,6 +226,7 @@ class G1E2EStateSeq(Dataset):
             self.clips.append(dict(key=key, p=p, n=p.shape[0]))
             for s in range(0, p.shape[0] - L + 1, stride):
                 self.windows.append((ci, s))
+            self.windows.append((ci, -1))          # -1 = the holistic resampling of this clip
 
     def __len__(self):
         return len(self.windows)
@@ -199,5 +234,9 @@ class G1E2EStateSeq(Dataset):
     def __getitem__(self, i):
         ci, s = self.windows[i]
         c = self.clips[ci]
-        x = (c["p"][s:s + self.L] - self.mean) / self.std
+        if s < 0:
+            rows = np.round(np.linspace(0, c["n"] - 1, self.L)).astype(np.int64)
+            x = (c["p"][rows] - self.mean) / self.std
+        else:
+            x = (c["p"][s:s + self.L] - self.mean) / self.std
         return dict(x=torch.from_numpy(x.astype(np.float32)), key=c["key"])

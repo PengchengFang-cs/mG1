@@ -59,6 +59,8 @@ def main():
     ap.add_argument("--cond-aug", type=float, default=0.5,
                     help="MIND: intent hidden states read at s ~ U(cond_aug, 1) in training")
     ap.add_argument("--cond-aug-test", type=float, default=0.75, help="MIND's fixed test-time s")
+    ap.add_argument("--lat-stat-rows", type=int, default=200000,
+                    help="latent rows sampled to measure the intent-latent normalisation")
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--wd", type=float, default=0.01)
@@ -96,12 +98,14 @@ def main():
         f"{args.vae} predates the shared-statistics change; retrain the VAE with the current script")
     stats = (vck["mean_full"].astype(np.float32), vck["std_full"].astype(np.float32))
     assert stats[0].shape[0] == TOKEN_DIM, f"VAE stats are {stats[0].shape[0]}-d, token is {TOKEN_DIM}"
-    tr = G1E2EWindows(args.rollouts, tok_path, args.H, args.F, gen_hz=args.gen_hz,
+    # The dataset takes the cache DIRECTORY: a caption's mask is only correct against its own length and
+    # the policy needs the real pooled vector, so tokens / lengths / pooled all travel together.
+    tr = G1E2EWindows(args.rollouts, tc, args.H, args.F, gen_hz=args.gen_hz,
                       stride=args.window_stride, obs_future=args.obs_future, max_clips=args.max_clips,
                       stats=stats, seed=args.seed)
-    te = G1E2EWindows(args.rollouts_eval, tok_path, args.H, args.F, gen_hz=args.gen_hz,
+    te = G1E2EWindows(args.rollouts_eval, tc, args.H, args.F, gen_hz=args.gen_hz,
                       stride=max(1, args.H), obs_future=args.obs_future,
-                      stats=stats, seed=args.seed + 1)
+                      stats=stats, seed=args.seed + 1, deterministic_caption=True)
     print(f"train {json.dumps(describe(tr))}")
     print(f"test  {json.dumps(describe(te))}")
     np.savez(out / "stats.npz", mean=tr.mean, std=tr.std, gen_hz=args.gen_hz, H=args.H, F=args.F)
@@ -119,6 +123,11 @@ def main():
         f"a different amount of real time at a different rate")
     n_lat = args.H // vae.down
     assert args.H % vae.down == 0, f"H={args.H} must be divisible by the VAE downsampling {vae.down}"
+    from hml_phys.intent_model import N_LAT, D_LAT
+    assert n_lat == N_LAT and vae.latent_dim == D_LAT, (
+        f"IntentDiT builds its positional embedding and input projection from the module-level "
+        f"N_LAT={N_LAT}, D_LAT={D_LAT} (intent_model.py:26), but this run gives {n_lat} latent frames of "
+        f"{vae.latent_dim} dims")
     print(f"frozen IntentVAE: input {ck['input_dim']}, latent {vae.latent_dim}, down {vae.down} "
           f"-> {n_lat} latent frames from {args.H} history rows")
 
@@ -132,66 +141,125 @@ def main():
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     act_mask = action_channel_mask(dev)
-    lens = __import__("joblib").load(len_path)
+
+    # Intent-latent normalisation. Flow matching mixes the target with eps ~ N(0,1), so the targets have
+    # to be unit-scale; the validated pipeline has a dedicated step for this
+    # (scripts/hml_phys/compute_intent_latent_stats.py, applied at train_intent_policy.py:130-133).
+    # Measured here rather than assumed, over a bounded sample of training windows.
+    import joblib
+    lat_stat_path = out / "intent_latent_stats.npz"
+    if lat_stat_path.exists():
+        z = np.load(lat_stat_path)
+        lat_mean = torch.tensor(z["mean"], device=dev)
+        lat_std = torch.tensor(z["std"], device=dev)
+    else:
+        from torch.utils.data import DataLoader as _DL
+        acc = []
+        with torch.no_grad():
+            for b in _DL(tr, batch_size=256, shuffle=False, num_workers=2):
+                for fld in ("x", "fut", "holi"):
+                    v = b[fld].to(dev)
+                    v = v[:, :, :PROPRIO_DIM] if fld == "x" else v
+                    _, mu, _ = vae.encode(v)
+                    acc.append(mu.reshape(-1, mu.shape[-1]).cpu())
+                if sum(a.shape[0] for a in acc) > args.lat_stat_rows:
+                    break
+        A = torch.cat(acc)
+        lat_mean = A.mean(0).to(dev)
+        lat_std = A.std(0).clamp_min(1e-3).to(dev)
+        np.savez(lat_stat_path, mean=lat_mean.cpu().numpy(), std=lat_std.cpu().numpy(),
+                 rows=int(A.shape[0]))
+    print(f"intent latents: |mean| {float(lat_mean.abs().mean()):.3f}  "
+          f"std {float(lat_std.mean()):.3f} (min {float(lat_std.min()):.3f}, "
+          f"max {float(lat_std.max()):.3f})")
+
+    def norm_lat(v):
+        return (v - lat_mean) / lat_std
+
+    # The unconditional text state is CLIP(''), cached once, not a zeroed caption: zeroing leaves a state
+    # that depends on the dropped caption's length, so classifier-free guidance has no fixed point to
+    # extrapolate from (and the policy's own mask, rebuilt from the real length in part_model.py:160,
+    # would still attend over that many slots of LayerNorm(0)-derived constants).
+    _tok_all = joblib.load(tok_path)
+    _len_all = joblib.load(tc / "lengths.pkl")
+    _pool_all = joblib.load(tc / "pooled.pkl")
+    assert "__uncond__" in _tok_all, (
+        f"{tok_path} has no CLIP('') entry; rebuild it with the current scripts/g1e2e_build_text_cache.py")
+    unc_tok = torch.tensor(_tok_all["__uncond__"][0], dtype=torch.float32, device=dev)
+    unc_len = int(_len_all["__uncond__"][0])
+    unc_pool = torch.tensor(_pool_all["__uncond__"][0], dtype=torch.float32, device=dev)
+    del _tok_all, _len_all, _pool_all
+    print(f"unconditional CLIP(''): {unc_len} tokens")
 
     def batch_to_dev(b):
-        x = b["x"].to(dev)
-        text = b["text"].to(dev).float()
-        text_len = torch.tensor([lens[k][0] for k in b["key"]], device=dev)
-        return x, b["holi"].to(dev), text, text_len, b["scal"].to(dev)
+        return (b["x"].to(dev), b["fut"].to(dev), b["holi"].to(dev), b["text"].to(dev).float(),
+                b["text_pooled"].to(dev).float(), b["text_len"].to(dev), b["scal"].to(dev))
 
-    def hidden_level(B, train):
+    def hidden_level(B, train, gen=None):
         """Noise level at which the intent hidden states are read. MIND augments the conditioning with
         s ~ U(s_min, 1) in training and uses a fixed 0.75 at test time; s = 1 is the clean read-out."""
         if args.cond_aug <= 0:
             return 1.0
         if not train:
             return float(args.cond_aug_test)
-        return args.cond_aug + (1.0 - args.cond_aug) * torch.rand(B, device=dev)
+        return args.cond_aug + (1.0 - args.cond_aug) * torch.rand(B, device=dev, generator=gen)
 
-    def losses(x, holi, text, text_len, scal, train=True):
+    def losses(x, fut, holi, text, text_pooled, text_len, scal, train=True, gen=None):
         B, T, _ = x.shape
         obs = observed_mask(B, args.H, T, dev)
-        gen = generated_elements(obs, act_mask)
+        gmask = generated_elements(obs, None, act_mask)
         x_in = policy_input(x, obs, act_mask)
 
-        # The frozen VAE encodes the observed history into the intent latents the two predictors live in.
+        # The POSTERIOR MEAN, not a sample: the reference encodes with `_, mu, _ = vae.encode(...)`
+        # (train_intent_policy.py:132). CausalEncoder's first return is mu + randn*sigma, and that draw is
+        # not generator-controlled, so using it would also inject unseeded noise into the eval loss.
         with torch.no_grad():
-            lat_hist, _, _ = vae.encode(x[:, :args.H, :PROPRIO_DIM])
+            _, mu_hist, _ = vae.encode(x[:, :args.H, :PROPRIO_DIM])
+            _, mu_fut, _ = vae.encode(fut)
+            _, mu_holi, _ = vae.encode(holi)
+            lat_hist, lat_fut, lat_holi = norm_lat(mu_hist), norm_lat(mu_fut), norm_lat(mu_holi)
 
-        # One text-dropout mask shared by all three heads, so a dropped sample is unconditional everywhere.
-        keep = torch.rand(B, device=dev) >= (args.text_drop if train else 0.0)
-        txt = text * keep[:, None, None]
-        mem, mem_valid = model.adapter(txt, text_len)
-        mem_valid = mem_valid & keep[:, None]
+        # One dropout mask shared by all three heads. A dropped sample is replaced by the cached CLIP('')
+        # tokens, length AND pooled vector, giving a single well-defined unconditional state.
+        keep = torch.rand(B, device=dev, generator=gen) >= (args.text_drop if train else 0.0)
+        k3 = keep[:, None, None]
+        txt = torch.where(k3, text, unc_tok[None].expand_as(text))
+        pooled = torch.where(keep[:, None], text_pooled, unc_pool[None].expand_as(text_pooled))
+        tlen = torch.where(keep, text_len, torch.full_like(text_len, unc_len))
+        mem, mem_valid = model.adapter(txt, tlen)
 
-        # HIP: text -> holistic intent. Its target is the WHOLE CLIP resampled to H rows (the dataset's
-        # `holistic` field), because that is what a caption describes -- not the current window. It also
-        # keeps the latent count at what the intent DiT's positional embedding is sized for.
-        with torch.no_grad():
-            lat_holi, _, _ = vae.encode(holi)
-        tH = fl.sample_t(B, dev)
-        zH, _ = build_state_elem(lat_holi, torch.ones_like(lat_holi), tH)
+        # HIP: text -> holistic intent, the WHOLE CLIP resampled to H rows (what a caption describes).
+        tH = fl.sample_t(B, dev, generator=gen)
+        zH, _ = build_state_elem(lat_holi, torch.ones_like(lat_holi), tH, generator=gen)
         xH, _ = model.hip(zH, tH, mem, mem_valid)
         l_hip = latent_loss(*velocity_pair(xH, lat_holi, zH, tH))
 
-        # IIP: text + the observed history latents (as a prefix) + HIP's hidden states (as extra memory).
-        hH = intent_hidden(model.hip, lat_holi, hidden_level(B, train), mem=mem, mem_valid=mem_valid)
-        tI = fl.sample_t(B, dev)
-        zI, _ = build_state_elem(lat_hist, torch.ones_like(lat_hist), tI)
+        # IIP: predict the IMMEDIATE intent -- the encoding of the next H state rows -- from text, the
+        # history latents as a clean PREFIX, and HIP's hidden states as extra memory. Target and prefix
+        # must differ: with both set to the history latents the head copies a token it is handed in the
+        # same sequence (IntentDiT with prefix=True reads its output from tokens n_lat..2*n_lat-1), so it
+        # learns an identity map, l_iip collapses to ~0 and contributes no gradient, and `hI` -- one of
+        # the two signals MIND's policy reads -- becomes the hidden state of that identity.
+        hH = intent_hidden(model.hip, lat_holi, hidden_level(B, train, gen), generator=gen,
+                           mem=mem, mem_valid=mem_valid)
+        tI = fl.sample_t(B, dev, generator=gen)
+        zI, _ = build_state_elem(lat_fut, torch.ones_like(lat_fut), tI, generator=gen)
         xI, _ = model.iip(zI, tI, mem, mem_valid, prefix_latent=lat_hist, scalars=scal, mem_extra=hH)
-        l_iip = latent_loss(*velocity_pair(xI, lat_hist, zI, tI))
+        l_iip = latent_loss(*velocity_pair(xI, lat_fut, zI, tI))
 
-        # Policy: generate the future ACTION rows, reading the two predictors' HIDDEN STATES (not their
-        # latents) as extra tokens in its text stream (docs/07 §21.4-2).
-        hI = intent_hidden(model.iip, lat_hist, hidden_level(B, train), mem=mem, mem_valid=mem_valid,
-                           prefix_latent=lat_hist, scalars=scal, mem_extra=hH)
+        # Policy: generate the future ACTION rows, reading both predictors' HIDDEN STATES (not their
+        # latents) as extra tokens in its text stream, and the cache's real CLIP pooled vector as the
+        # sentence-level text -- `text_mode="sentence_xattn"` makes that the only sentence signal, and a
+        # mean over the 50 token slots is not the projection-space embedding the policy expects.
+        hI = intent_hidden(model.iip, lat_fut, hidden_level(B, train, gen), generator=gen,
+                           mem=mem, mem_valid=mem_valid, prefix_latent=lat_hist, scalars=scal,
+                           mem_extra=hH)
         toks, tval = model.intent_tokens(hH, hI, keep)
-        t = fl.sample_t(B, dev)
-        z, _ = build_state_elem(x_in, gen, t)
-        x0_hat = model.policy(z, obs, t, txt, txt.mean(1), text_len, scal,
+        t = fl.sample_t(B, dev, generator=gen)
+        z, _ = build_state_elem(x_in, gmask, t, generator=gen)
+        x0_hat = model.policy(z, obs, t, txt, pooled, tlen, scal,
                               extra_tokens=toks, extra_valid=tval)
-        l_act = policy_loss(*velocity_pair(x0_hat, x, z, t), gen)
+        l_act = policy_loss(*velocity_pair(x0_hat, x_in, z, t), gmask)
         return l_hip, l_iip, l_act
 
     def loader(ds, shuffle):
@@ -201,12 +269,18 @@ def main():
     tl, el = loader(tr, True), loader(te, False)
 
     def evaluate():
+        """Seeded and deterministic: the criterion must not move because the noise draws moved.
+
+        The reference pins a generator for exactly this reason (train_intent_policy.py:232-237). Here the
+        test dataset also fixes its caption choice (deterministic_caption=True), so the only thing that
+        changes between evaluations is the weights."""
         model.eval()
+        eg = torch.Generator(device=dev).manual_seed(args.seed)
         acc, n = np.zeros(3), 0
         with torch.no_grad():
             for b in el:
-                x, holi, text, tlen, scal = batch_to_dev(b)
-                ls = losses(x, holi, text, tlen, scal, train=False)
+                x, fut, holi, text, pooled, tlen, scal = batch_to_dev(b)
+                ls = losses(x, fut, holi, text, pooled, tlen, scal, train=False, gen=eg)
                 acc += np.array([float(v) for v in ls]) * x.shape[0]
                 n += x.shape[0]
         model.train()
@@ -217,9 +291,14 @@ def main():
         for b in tl:
             if step >= args.steps:
                 break
-            x, holi, text, tlen, scal = batch_to_dev(b)
-            l_hip, l_iip, l_act = losses(x, holi, text, tlen, scal)
+            x, fut, holi, text, pooled, tlen, scal = batch_to_dev(b)
+            l_hip, l_iip, l_act = losses(x, fut, holi, text, pooled, tlen, scal)
             loss = l_hip + l_iip + l_act                      # MIND eq. 5, equal weights
+            if not torch.isfinite(loss):
+                raise SystemExit(
+                    f"non-finite loss at step {step}: hip {float(l_hip)} iip {float(l_iip)} "
+                    f"act {float(l_act)}. Aborting rather than overwriting latest.pt with NaN weights "
+                    f"and burning the remaining steps on a criterion that can never improve again.")
             opt.zero_grad()
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

@@ -50,7 +50,10 @@ def main():
             caps = [norm(c) for c in rec["captions"] if norm(c)]
             assert caps, f"clip {key} has no usable caption"
             per_clip[key] = caps
-    uniq = sorted({c for caps in per_clip.values() for c in caps})
+    # The empty caption is the unconditional state: text dropout and classifier-free guidance both need
+    # ONE well-defined "no text" input. Zeroing a real caption's features instead leaves a state that
+    # depends on that caption's length, so CFG would have nothing fixed to extrapolate from.
+    uniq = sorted({c for caps in per_clip.values() for c in caps} | {""})
     print(f"clips {len(per_clip)}   unique captions {len(uniq)}   "
           f"per clip min {min(len(v) for v in per_clip.values())} "
           f"max {max(len(v) for v in per_clip.values())}")
@@ -69,8 +72,16 @@ def main():
             x = model.ln_final(x).type(model.dtype)                      # (B, 77, 768)
             eot = x[torch.arange(x.shape[0]), tok.argmax(dim=-1)]
             pooled = (eot @ model.text_projection).float().cpu().numpy()
-            tokens = x[:, : args.max_tokens].half().cpu().numpy()
             lengths = (tok.argmax(dim=-1) + 1).clamp(max=args.max_tokens).cpu().numpy()
+            # Zero everything past each caption's own length, as scripts/hml_phys/build_text_cache.py:51
+            # does. ln_final emits activations at all 50 positions -- measured mean|x| 0.76, max 8.3 at
+            # padding slots -- so leaving them in means any consumer that masks with a different
+            # caption's length attends to high-magnitude non-text vectors presented as text.
+            xt = x[:, : args.max_tokens].clone()
+            idx = torch.arange(args.max_tokens, device=xt.device)[None]
+            lt = torch.as_tensor(lengths, device=xt.device)[:, None]
+            xt = xt.masked_fill((idx >= lt)[..., None], 0.0)
+            tokens = xt.half().cpu().numpy()
             for j, c in enumerate(chunk):
                 feats[c] = (tokens[j], int(lengths[j]))
                 pools[c] = pooled[j]
@@ -82,6 +93,11 @@ def main():
         tok_out[key] = np.stack([feats[c][0] for c in caps])
         len_out[key] = np.array([feats[c][1] for c in caps], np.int64)
         pool_out[key] = np.stack([pools[c] for c in caps]).astype(np.float32)
+
+    tok_out["__uncond__"] = np.stack([feats[""][0]])
+    len_out["__uncond__"] = np.array([feats[""][1]], np.int64)
+    pool_out["__uncond__"] = np.stack([pools[""]]).astype(np.float32)
+    print(f"unconditional CLIP(''): {len_out['__uncond__'][0]} tokens")
 
     joblib.dump(tok_out, out / "tokens.pkl")
     joblib.dump(len_out, out / "lengths.pkl")

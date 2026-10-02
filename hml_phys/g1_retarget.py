@@ -88,7 +88,13 @@ class Retargeter:
         `grad_fit_robot.load_amass_data` leaves in place (which would play 120 Hz AMASS four times slow).
         """
         dev = self.device
+        # `skip` is an integer stride, so the resulting keyframe rate is mocap_fps/skip, which is only
+        # exactly TARGET_FR when mocap_fps is a multiple of it: a 100 Hz source gives skip 3 and 33.33 Hz.
+        # Labelling that 30 makes the motion library play it 11% slow (motion_lib_robot reads
+        # dt = 1/fps), and 38% of the HumanML3D clips come from 100 Hz files. The library supports a
+        # per-clip fps (_motion_fps, _motion_dt), so the true rate is recorded instead.
         skip = max(1, int(round(float(mocap_fps) / TARGET_FR)))
+        true_fps = float(mocap_fps) / skip
         poses, trans_np = poses[::skip], trans[::skip]
         N = poses.shape[0]
         if N < 10:
@@ -149,12 +155,13 @@ class Retargeter:
             root_dump = root_trans.clone()
             root_dump[..., 2] -= fk["global_translation"][..., 2].min().item() - 0.08
 
-        entry = self._to_29(pose_robot[0].detach(), dof[0, :, :, 0].detach(), root_dump, gt_root_rot, err)
+        entry = self._to_29(pose_robot[0].detach(), dof[0, :, :, 0].detach(), root_dump, gt_root_rot,
+                            err, true_fps)
         del dof, fk, pose_robot
         torch.cuda.empty_cache()
         return entry
 
-    def _to_29(self, pose21, dof21, root_dump, gt_root_rot, err):
+    def _to_29(self, pose21, dof21, root_dump, gt_root_rot, err, fps):
         """Re-lay the 21-DoF rows onto the 29-DoF skeleton the env's FK expects (docs/09 §6.13).
 
         Resolved by body NAME: the right arm shifts three rows between the layouts
@@ -175,7 +182,7 @@ class Retargeter:
             dof=dof29.numpy(),
             dof_picked=dof29[:, PICKED_JOINT].numpy(),
             root_rot=sRot.from_rotvec(gt_root_rot.cpu().numpy()).as_quat(),
-            fps=TARGET_FR,
+            fps=fps,
             body_names=self.names29 + list(self.cfg.Extend.extend_link_name),
             dof_names=self.cfg.actuated_joint_names,
             fit_err_m=err,

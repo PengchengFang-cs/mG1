@@ -5,10 +5,17 @@ joint targets; we keep what it saw of its own body and what it did, and pair tha
 HumanML3D captions. A policy trained on this has to infer from the text alone what the tracker inferred
 from the reference -- which is exactly the ambiguity MIND's intent VAE exists to model.
 
-Only successful episodes are kept, following MIND ("PHC 跟踪 HumanML3D，只留成功", docs/01 §一). An episode
-fails when the env's own termination fires, i.e. illegal contact or the reference-distance limit; the limit
-is the config's training value here, NOT the 0.5 m that OnPolicyRunner.eval() substitutes, because we are
-collecting data rather than scoring the tracker.
+Only successful episodes are kept, following MIND ("PHC 跟踪 HumanML3D，只留成功", docs/01 §一). What
+"successful" means has to be said precisely, because the env changes the criterion under the flags this
+config sets: with `env.test`/`env.im_eval` True, `legged_robot.py:618-630` switches the reference check
+from "ANY body farther than the limit" to "the MEAN over bodies farther than the limit", and `env.test`
+is required here (it is what gives `motion_start_times = 0`). The threshold is therefore the only free
+part, and it is set to 0.5 m -- the authors' own success criterion, which `OnPolicyRunner.eval()`
+substitutes for scoring -- rather than the 1.5 m `config_eval.yaml` ships or the 5.0 m of the training
+config. At 1.5 m an episode survives with a 1.49 m AVERAGE body error, i.e. the robot stayed upright while
+doing something other than what its caption says, and that clip then trains the policy under that caption.
+The per-clip mean tracking error the env computes into `extras["mpjpe"]` is recorded alongside each clip
+so the filter can be tightened afterwards without re-running the simulation.
 
 Three different rates are involved and only one of them is a choice:
 
@@ -32,8 +39,15 @@ into the data.
 
 Token layout for this line (21 DoF, from the env's own buffers):
     proprio 51 = base_lin_vel(3) | base_ang_vel(3) | projected_gravity(3) | dof_pos(21) | dof_vel(21)
-    action  21   the tracker's output; the robot is driven by
-                 target = default_dof_pos + action_scale * action, action_scale = 0.25
+    action  21   the tracker's RAW output, before the env touches it. The robot is actually driven by
+                 target = default_dof_pos + 0.25 * (0.8 * a_t + 0.2 * a_{t-1}): legged_robot.py:299 clips
+                 to +/-10, :315 applies an unconditional 0.8/0.2 action EMA (control.action_filt is False
+                 and ctrl-delay randomisation is off, so this is the only filter), and :1731 scales by
+                 0.25. The raw action is stored because that is what a policy trained on this data should
+                 emit -- the env applies the same filter at evaluation time -- but any consumer that
+                 reconstructs joint targets, or deploys outside this env, must apply the EMA itself.
+                 A consequence worth knowing: the (proprio_t -> a_t) map is only Markov up to a_{t-1},
+                 which the 51-d proprio does not contain.
     token   72 = proprio | action
 Nothing is scaled or blanked here. A consumer that wants ADAPT-style scaling or a blanked linear velocity
 can do it at training time; the recording stays raw so that choice is not baked in.
@@ -78,6 +92,8 @@ def main():
     ap.add_argument("--load-run", default="25_12_11_18-16-37_OmniH2O_STUDENT",
                     help="G1-Full; the G1-Clean student is 25_12_11_18-18-10_OmniH2O_STUDENT_FILTER")
     ap.add_argument("--num-envs", type=int, default=512)
+    ap.add_argument("--ref-dist", type=float, default=0.5,
+                    help="mean-body reference-distance limit; 0.5 is the authors' own success criterion")
     ap.add_argument("--keep-failed", action="store_true",
                     help="keep terminated episodes too (truncated at termination); off by default, as MIND does")
     ap.add_argument("--policy-ckpt", default="", help="on-policy hook: our own policy, for DAgger")
@@ -93,7 +109,9 @@ def main():
     run_dir = LOG_ROOT / args.load_run
     assert run_dir.exists(), (
         f"{run_dir} not found -- run `python scripts/fromw1_eval_g1_policy.py --link` first")
-    assert not args.policy_ckpt, "the on-policy path is wired but not implemented yet; leave --policy-ckpt empty"
+    assert not args.policy_ckpt and args.mix_prob == 0.0, (
+        "the on-policy path is wired but not implemented yet; leave --policy-ckpt empty and --mix-prob 0. "
+        "Accepting a non-zero --mix-prob and ignoring it would silently produce pure-teacher data.")
 
     # cwd must be legged_gym/: cfg_g1/asset/asset_teleop.yaml holds a plain relative asset path with no
     # {LEGGED_GYM_ROOT_DIR} placeholder, and the repo has two resources trees -- only this one has the
@@ -115,7 +133,8 @@ def main():
     with hydra.initialize_config_dir(version_base=None, config_dir=str(CFG_DIR)):
         cfg_hydra = hydra.compose(config_name="config_eval", overrides=[
             f"motion.motion_file={refs}", f"num_envs={args.num_envs}", f"sim_device={args.device}",
-            f"load_run={args.load_run}", "headless=True", "use_wandb=False", *overrides])
+            f"load_run={args.load_run}", "headless=True", "use_wandb=False",
+            f"asset.termination_scales.max_ref_motion_distance={args.ref_dist}", *overrides])
     cfg = EasyDict(OmegaConf.to_container(cfg_hydra, resolve=True))
     cfg.physics_engine = gymapi.SIM_PHYSX
 
@@ -160,6 +179,8 @@ def main():
         steps = (secs / env.dt).ceil().long()
         horizon = int(steps[: min(len(steps), args.num_envs)].max().item())
 
+        mpjpe_sum = torch.zeros(env.num_envs, dtype=torch.float64)
+        mpjpe_n = torch.zeros(env.num_envs, dtype=torch.float64)
         prop = torch.zeros((horizon, env.num_envs, PROPRIO_DIM), dtype=torch.float32)
         act = torch.zeros((horizon, env.num_envs, ACTION_DIM), dtype=torch.float32)
         length = torch.zeros(env.num_envs, dtype=torch.long)
@@ -179,17 +200,23 @@ def main():
             with torch.inference_mode():
                 a = policy(obs.detach())
             act[t] = a.detach().cpu()
-            obs, _, _, dones, _ = env.step(a.detach())
+            obs, _, _, dones, infos = env.step(a.detach())
+            if isinstance(infos, dict) and "mpjpe" in infos:
+                m = infos["mpjpe"].detach().cpu().double()
+                mpjpe_sum += m * active.double()
+                mpjpe_n += active.double()
             length[active] = t + 1
-            # Reaching the end of its own motion is not a failure; terminating before that is.
-            # The env ends a clip on `time > motion_len` in CONTINUOUS time (legged_robot.py:641, with
-            # motion_len in seconds), while steps_cpu is that length discretised by env.dt, so the two
-            # disagree by a step or two at the boundary. Without the slack a normal end-of-motion reset
-            # is misread as a failure -- which marked 20 of 24 smoke clips failed when 2 actually were.
-            complete = (t + 1) >= steps_cpu - 3
-            newly_failed = dones.detach().cpu().bool() & active & ~complete
+            # Reaching the end of its own motion is not a failure; terminating before that is. The env
+            # already distinguishes the two: `terminate_by_1time_motion` is True for g1
+            # (cfg_g1/asset/asset_teleop.yaml), so `time_out_buf` IS `time > motion_len`
+            # (legged_robot.py:643-646). Using it is exact, where the earlier +/-3-step slack both
+            # deleted the last 2-3 frames of EVERY clip (measured: exactly 3 on 1539 of 1560) and hid a
+            # fall occurring inside that window by recording it as a success.
+            timed_out = env.time_out_buf.detach().cpu().bool()
+            d = dones.detach().cpu().bool()
+            newly_failed = d & active & ~timed_out
             failed |= newly_failed
-            active &= ~(complete | newly_failed)
+            active &= ~((d & timed_out) | newly_failed)
             if not bool(active.any()):
                 break
 
@@ -207,6 +234,7 @@ def main():
                 proprio=prop[:L, i].numpy().astype(np.float32),
                 action=act[:L, i].numpy().astype(np.float32),
                 failed=bool(failed[i]),
+                mpjpe_mean_m=float(mpjpe_sum[i] / mpjpe_n[i]) if float(mpjpe_n[i]) > 0 else float("nan"),
                 n_frames=L,
                 fps=CONTROL_HZ,
                 captions=text_index[key]["captions"],
@@ -220,17 +248,20 @@ def main():
             env.forward_motion_samples()
             obs, _ = env.reset()
 
+    n_short = n_motions - len(data) - n_fail
     frames = sum(v["n_frames"] for v in data.values())
-    print(f"\nkept {len(data)}/{n_motions} clips ({n_fail} failed), {frames} frames "
+    print(f"\nkept {len(data)}/{n_motions} clips ({n_fail} failed, {n_short} too short/dup), {frames} frames "
           f"({frames / CONTROL_HZ / 60:.1f} min) in {time.time() - t0:.0f}s")
     print(f"token layout: proprio {PROPRIO_DIM} | action {ACTION_DIM} = {TOKEN_DIM}")
     joblib.dump(data, out)
-    meta = dict(n_clips=len(data), n_motions=n_motions, n_failed=n_fail, frames=frames,
+    meta = dict(n_clips=len(data), n_motions=n_motions, n_failed=n_fail, n_dropped_other=n_short,
+                frames=frames,
                 minutes=frames / CONTROL_HZ / 60, proprio_dim=PROPRIO_DIM, action_dim=ACTION_DIM,
                 token_dim=TOKEN_DIM, action_scale=float(cfg.control.action_scale),
                 control_hz=CONTROL_HZ, ref_fps=REF_FPS,
                 tracker=args.load_run, refs=str(refs),
                 ref_distance_limit=float(cfg.asset.termination_scales.max_ref_motion_distance),
+                ref_distance_is_mean_over_bodies=True, action_is_pre_ema=True,
                 keep_failed=bool(args.keep_failed))
     out.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2))
     print(f"wrote {out}  ({out.stat().st_size / 1e6:.0f} MB)")
