@@ -13,7 +13,7 @@ REPO=/iridisfs/scratch/pf2m24/projects/motion_rebot
 JOB=${JOB:-1678103}
 NSHARDS=${NSHARDS:-20}
 NGPU=${NGPU:-2}
-TRAIN_N=${TRAIN_N:-2000}
+TRAIN_N=${TRAIN_N:-0}        # 0 = every clip; the 2000-clip subset was only to validate the chain
 cd "$REPO"; mkdir -p data/g1_e2e logs
 
 stage() {   # stage <split> <sample:0=all>
