@@ -30,7 +30,15 @@ import torch
 EXTEND_LINKS = {
     "left_hand_site": ("left_elbow_link", [0.2, 0, 0]),
     "right_hand_site": ("right_elbow_link", [0.2, 0, 0]),
-    "head_link": ("torso_link", [0, 0, 0.45]),
+    # PELVIS, not torso_link. Both of the env's own configs parent the head extend to body index 0:
+    # `extend_parent_ids: [17, 21, 0]` (extra/extra_base.yaml:14) and `extend_parent_idx: [19, 26, 0]`
+    # (phc/phc_base.yaml:4), each with translation [0, 0, 0.45]. Parenting it to torso_link instead put
+    # the fit target 4.4 cm off -- the pelvis->torso offset at zero waist angle is [-0.0040, 0, 0.044] m
+    # from g1_29dof.xml:128-136 -- so the retargeter optimised towards a head point the env never
+    # reconstructs, inflating fit_err_m and biasing the fitted DoF. Tracking stayed self-consistent
+    # (the env builds both the reference and the robot's head from its own config), which is why
+    # check_upright could not catch it.
+    "head_link": ("pelvis", [0, 0, 0.45]),
 }
 
 # Joint order the policy expects, i.e. the revolute order of g1_21dof.urdf. Asserted against the MJCF

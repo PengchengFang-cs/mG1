@@ -48,6 +48,18 @@ def main():
     ap.add_argument("--H", type=int, default=16, help="history rows; 16 at 25 Hz = 0.64 s")
     ap.add_argument("--F", type=int, default=4, help="generated action rows")
     ap.add_argument("--obs-future", default="first", choices=["none", "first", "all"])
+    ap.add_argument("--p-rest", type=float, default=0.1,
+                    help="share of start-rest windows: history = 16 copies of the clip's first frame "
+                         "with zero velocities and the hold action, future = the clip's opening. The "
+                         "closed loop starts exactly there and the recorded data contains no such window "
+                         "(dataset.py:19-21). Needs default_dof_pos in the rollouts meta.")
+    ap.add_argument("--p-holi-exact", type=float, default=0.25,
+                    help="probability that the holistic target is the exact test-time span rather than a "
+                         "random sub-span (intent_data.holistic_crop_rows)")
+    ap.add_argument("--max-mpjpe", type=float, default=0.0,
+                    help="drop clips whose mean body tracking error exceeds this (m). 0 = keep all, which "
+                         "is what the runs so far did: the recorder only removed the clips where the "
+                         "tracker FELL, so a clip followed at 0.49 m average still carries its caption.")
     ap.add_argument("--hidden", type=int, default=576, help="policy width; divisible by heads and parts")
     ap.add_argument("--heads", type=int, default=12)
     ap.add_argument("--depth-double", type=int, default=3)
@@ -55,6 +67,26 @@ def main():
     ap.add_argument("--intent-dim", type=int, default=384)
     ap.add_argument("--intent-heads", type=int, default=6)
     ap.add_argument("--intent-depth", type=int, default=4)
+    ap.add_argument("--intent-mlp", type=float, default=1.5,
+                    help="SwiGLU ratio in HIP/IIP. 1.5 is the reference (train_intent_policy.py:32), "
+                         "chosen to keep the total under 100M; the class default is 4.0.")
+    ap.add_argument("--ema-decay", type=float, default=0.995)
+    ap.add_argument("--ema-every", type=int, default=10,
+                    help="0 disables EMA. The reference rolls out EMA weights (mc_rollout.py:25,31) and "
+                         "its reproduced R@1 0.4117 is an EMA number.")
+    ap.add_argument("--select", default="chain", choices=["chain", "act"],
+                    help="which test loss picks best.pt. 'chain' = the action loss when the intents come "
+                         "from the test-time SAMPLING chain, i.e. what the closed loop actually feeds the "
+                         "policy (train_intent_policy.py:162,246). 'act' = the old behaviour, measured "
+                         "with GROUND-TRUTH intents: lat_fut latent frame 0 encodes exactly the F rows "
+                         "whose actions are being predicted, so it selects the checkpoint that leans "
+                         "hardest on an oracle that does not exist at inference.")
+    ap.add_argument("--chain-steps", type=int, default=10)
+    ap.add_argument("--chain-cfg", type=float, default=2.5)
+    ap.add_argument("--eval-batches", type=int, default=20,
+                    help="test batches per evaluation. The chain criterion runs a full 10-step HIP and "
+                         "IIP sample per batch, so scoring the whole test split every eval would dominate "
+                         "the run; the loader is unshuffled, so a fixed prefix stays deterministic.")
     ap.add_argument("--text-drop", type=float, default=0.1)
     ap.add_argument("--cond-aug", type=float, default=0.5,
                     help="MIND: intent hidden states read at s ~ U(cond_aug, 1) in training")
@@ -82,7 +114,7 @@ def main():
     from hml_phys.g1e2e_data import G1E2EWindows, TOKEN_DIM, PROPRIO_DIM, describe
     from hml_phys.g1e2e_flow import (action_channel_mask, build_state_elem, generated_elements,
                                      latent_loss, observed_mask, policy_input, policy_loss, velocity_pair)
-    from hml_phys.intent_flow import intent_hidden
+    from hml_phys.intent_flow import intent_hidden, sample_latent
     from hml_phys.intent_model import IntentPolicy
     from hml_phys.intent_vae import IntentVAE
     from hml_phys import flow as fl
@@ -102,10 +134,13 @@ def main():
     # the policy needs the real pooled vector, so tokens / lengths / pooled all travel together.
     tr = G1E2EWindows(args.rollouts, tc, args.H, args.F, gen_hz=args.gen_hz,
                       stride=args.window_stride, obs_future=args.obs_future, max_clips=args.max_clips,
-                      stats=stats, seed=args.seed)
+                      stats=stats, seed=args.seed, p_rest=args.p_rest, holi_aug=True,
+                      p_holi_exact=args.p_holi_exact, max_mpjpe=args.max_mpjpe)
+    # The test set takes NO augmentation: the selection criterion must only move when the weights move.
     te = G1E2EWindows(args.rollouts_eval, tc, args.H, args.F, gen_hz=args.gen_hz,
                       stride=max(1, args.H), obs_future=args.obs_future,
-                      stats=stats, seed=args.seed + 1, deterministic_caption=True)
+                      stats=stats, seed=args.seed + 1, deterministic_caption=True,
+                      p_rest=0.0, holi_aug=False, max_mpjpe=args.max_mpjpe)
     print(f"train {json.dumps(describe(tr))}")
     print(f"test  {json.dumps(describe(te))}")
     np.savez(out / "stats.npz", mean=tr.mean, std=tr.std, gen_hz=args.gen_hz, H=args.H, F=args.F)
@@ -134,13 +169,25 @@ def main():
     policy_kw = dict(hidden_dim=args.hidden, num_heads=args.heads, depth_double=args.depth_double,
                      depth_single=args.depth_single, text_mode="sentence_xattn",
                      text_cross_attention=True, n_scalar_cond=2, part_dims=[TOKEN_DIM])
+    # intent_mlp is the 5th positional argument (intent_model.py:115) and defaults to 4.0. Omitting it
+    # took that default instead of the reference's validated 1.5, giving 126.1 M params against the
+    # reference's ratio -- a 2.67x wider SwiGLU in both HIP and IIP, on 1/12 of the data. Measured on
+    # this model: 126.1 M at 4.0 vs 117.2 M at 1.5 (logs/g1e2e_policy.log:4, g1e2e_policy2.log:4). The
+    # reference's own 99.84 M is a different model (its own part_dims) and is NOT this model's target.
     model = IntentPolicy(policy_kw, args.intent_dim, args.intent_heads, args.intent_depth,
-                         text_token_dim=768).to(dev)
+                         args.intent_mlp, text_token_dim=768).to(dev)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"IntentPolicy {n_par / 1e6:.1f} M params   flat part_dims=[{TOKEN_DIM}]")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     act_mask = action_channel_mask(dev)
+    # How many future rows keep their proprio. This has to agree with the dataset's obs_future, and it is
+    # what `policy_input` was silently overriding: row H is the state the loop is in when it plans.
+    n_fut_prop = {"none": 0, "first": 1, "all": args.F}[args.obs_future]
+    print(f"obs_future={args.obs_future}: the policy sees the proprio of {n_fut_prop} future row(s); "
+          f"row H is the state its first action is applied in")
+    ema = ({k: v.detach().clone().float() for k, v in model.state_dict().items()}
+           if args.ema_every > 0 else None)
 
     # Intent-latent normalisation. Flow matching mixes the target with eps ~ N(0,1), so the targets have
     # to be unit-scale; the validated pipeline has a dedicated step for this
@@ -155,11 +202,18 @@ def main():
     else:
         from torch.utils.data import DataLoader as _DL
         acc = []
+        # shuffle=True: `tr.windows` is built clip by clip in sorted key order, so shuffle=False stopped
+        # after the alphabetically first ~11% of clips and measured the holistic statistics on ~200 of
+        # 1816 holistic vectors. The reference shuffles (compute_intent_latent_stats.py:21-22).
+        _g = torch.Generator().manual_seed(args.seed)
         with torch.no_grad():
-            for b in _DL(tr, batch_size=256, shuffle=False, num_workers=2):
+            for b in _DL(tr, batch_size=256, shuffle=True, num_workers=2, generator=_g):
                 for fld in ("x", "fut", "holi"):
                     v = b[fld].to(dev)
-                    v = v[:, :, :PROPRIO_DIM] if fld == "x" else v
+                    # Only the H HISTORY rows, which is the only thing `losses` ever encodes from `x`.
+                    # Encoding all H+F rows added a 5th latent frame built from the zeroed future proprio
+                    # -- a sequence that never exists -- to the statistics.
+                    v = v[:, :args.H, :PROPRIO_DIM] if fld == "x" else v
                     _, mu, _ = vae.encode(v)
                     acc.append(mu.reshape(-1, mu.shape[-1]).cpu())
                 if sum(a.shape[0] for a in acc) > args.lat_stat_rows:
@@ -208,7 +262,7 @@ def main():
         B, T, _ = x.shape
         obs = observed_mask(B, args.H, T, dev)
         gmask = generated_elements(obs, None, act_mask)
-        x_in = policy_input(x, obs, act_mask)
+        x_in = policy_input(x, obs, act_mask, n_future_proprio=n_fut_prop)
 
         # The POSTERIOR MEAN, not a sample: the reference encodes with `_, mu, _ = vae.encode(...)`
         # (train_intent_policy.py:132). CausalEncoder's first return is mu + randn*sigma, and that draw is
@@ -268,22 +322,70 @@ def main():
 
     tl, el = loader(tr, True), loader(te, False)
 
+    @torch.no_grad()
+    def chain_action_loss(x, fut_unused, holi_unused, text, text_pooled, text_len, scal, gen):
+        """The action loss when the intents come from the TEST-TIME SAMPLING CHAIN, not from the VAE.
+
+        This is the reference's selection criterion (train_intent_policy.py:162-191, 246: "select on what
+        the closed loop actually feeds the policy"). It matters here more than it does there: `lat_fut` is
+        the encoding of rows H..2H-1, and the VAE downsamples causally by 4, so its FIRST latent frame
+        encodes exactly rows H..H+F-1 -- the F rows whose actions the policy is being trained to emit.
+        Selecting on the ground-truth-intent loss therefore picks the checkpoint that leans hardest on an
+        oracle which, at inference, is replaced by a 10-step sample from text + history.
+        """
+        B, T, _ = x.shape
+        obs = observed_mask(B, args.H, T, dev)
+        gmask = generated_elements(obs, None, act_mask)
+        x_in = policy_input(x, obs, act_mask, n_future_proprio=n_fut_prop)
+        _, mu_hist, _ = vae.encode(x[:, :args.H, :PROPRIO_DIM])
+        lat_hist = norm_lat(mu_hist)
+        s_t = 1.0 if args.cond_aug <= 0 else float(args.cond_aug_test)
+
+        mem_c, mv_c = model.adapter(text, text_len)
+        mem_u, mv_u = model.adapter(unc_tok[None].expand_as(text),
+                                    torch.full_like(text_len, unc_len))
+        I_H = sample_latent(model.hip, B, mem_c, mv_c, mem_u, mv_u, num_steps=args.chain_steps,
+                            cfg_scale=args.chain_cfg, generator=gen, device=dev)
+        hH_c = intent_hidden(model.hip, I_H, s_t, gen, mem=mem_c, mem_valid=mv_c)
+        hH_u = intent_hidden(model.hip, I_H, s_t, gen, mem=mem_u, mem_valid=mv_u)
+        I_I = sample_latent(model.iip, B, mem_c, mv_c, mem_u, mv_u, num_steps=args.chain_steps,
+                            cfg_scale=args.chain_cfg, generator=gen, prefix=lat_hist, scalars=scal,
+                            extra=hH_c, extra_u=hH_u, device=dev)
+        hI_c = intent_hidden(model.iip, I_I, s_t, gen, mem=mem_c, mem_valid=mv_c,
+                             prefix_latent=lat_hist, scalars=scal, mem_extra=hH_c)
+        toks, tval = model.intent_tokens(hH_c, hI_c, torch.ones(B, dtype=torch.bool, device=dev))
+        t = fl.sample_t(B, dev, generator=gen)
+        z, _ = build_state_elem(x_in, gmask, t, generator=gen)
+        x0_hat = model.policy(z, obs, t, text, text_pooled, text_len, scal,
+                              extra_tokens=toks, extra_valid=tval)
+        return policy_loss(*velocity_pair(x0_hat, x_in, z, t), gmask)
+
     def evaluate():
         """Seeded and deterministic: the criterion must not move because the noise draws moved.
 
         The reference pins a generator for exactly this reason (train_intent_policy.py:232-237). Here the
         test dataset also fixes its caption choice (deterministic_caption=True), so the only thing that
-        changes between evaluations is the weights."""
+        changes between evaluations is the weights. Measured on the EMA weights when EMA is on, because
+        those are the weights the closed loop rolls out (mc_rollout.py:25,31)."""
+        swapped = None
+        if ema is not None:
+            swapped = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            model.load_state_dict({k: v.to(swapped[k].dtype) for k, v in ema.items()})
         model.eval()
         eg = torch.Generator(device=dev).manual_seed(args.seed)
-        acc, n = np.zeros(3), 0
+        acc, n = np.zeros(4), 0
         with torch.no_grad():
-            for b in el:
+            for nb, b in enumerate(el):
+                if args.eval_batches and nb >= args.eval_batches:
+                    break
                 x, fut, holi, text, pooled, tlen, scal = batch_to_dev(b)
                 ls = losses(x, fut, holi, text, pooled, tlen, scal, train=False, gen=eg)
-                acc += np.array([float(v) for v in ls]) * x.shape[0]
+                ch = chain_action_loss(x, fut, holi, text, pooled, tlen, scal, eg)
+                acc += np.array([float(v) for v in ls] + [float(ch)]) * x.shape[0]
                 n += x.shape[0]
         model.train()
+        if swapped is not None:
+            model.load_state_dict(swapped)
         return acc / n
 
     hist, best, step, t0 = [], float("inf"), 0, time.time()
@@ -304,26 +406,44 @@ def main():
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             step += 1
+            if ema is not None and step % args.ema_every == 0:
+                with torch.no_grad():
+                    for k, v in model.state_dict().items():
+                        if v.dtype.is_floating_point:
+                            ema[k].mul_(args.ema_decay).add_(v.float(), alpha=1 - args.ema_decay)
+                        else:
+                            ema[k].copy_(v)
             if step % args.log_every == 0:
                 print(f"step {step} loss={float(loss):.4f} hip={float(l_hip):.4f} "
                       f"iip={float(l_iip):.4f} act={float(l_act):.4f} gn={float(gn):.2f} "
                       f"{(time.time() - t0) / step * 1000:.0f}ms/it", flush=True)
             if step % args.eval_every == 0 or step == args.steps:
                 e = evaluate()
-                hist.append(dict(step=step, hip=e[0], iip=e[1], act=e[2], sum=float(e.sum())))
-                print(f"  [eval] step {step} hip {e[0]:.4f} iip {e[1]:.4f} act {e[2]:.4f}", flush=True)
-                ck_out = dict(model=model.state_dict(), args=vars(args), step=step,
-                              mean=tr.mean, std=tr.std, policy_kw=policy_kw, vae=str(args.vae))
+                hist.append(dict(step=step, hip=e[0], iip=e[1], act=e[2], act_chain=e[3],
+                                 sum=float(e[:3].sum())))
+                print(f"  [eval] step {step} hip {e[0]:.4f} iip {e[1]:.4f} act {e[2]:.4f} "
+                      f"act_chain {e[3]:.4f}", flush=True)
+                # Ship the EMA weights as `model`, since those are the ones the closed loop rolls out;
+                # the raw iterate goes alongside so a run can be continued or compared.
+                shipped = ({k: v.to(model.state_dict()[k].dtype) for k, v in ema.items()}
+                           if ema is not None else model.state_dict())
+                ck_out = dict(model=shipped, raw=model.state_dict() if ema is not None else None,
+                              args=vars(args), step=step, mean=tr.mean, std=tr.std,
+                              policy_kw=policy_kw, vae=str(args.vae),
+                              intent_latent_mean=lat_mean.cpu().numpy(),
+                              intent_latent_std=lat_std.cpu().numpy())
                 torch.save(ck_out, out / "latest.pt")
-                # Selection is on the ACTION loss alone: HIP overfits long before the policy does, so a
-                # sum-based criterion would start picking checkpoints for the wrong reason.
-                if e[2] < best:
-                    best = e[2]
+                # Selection is on the chain action loss by default: HIP overfits long before the policy
+                # does (so a sum-based criterion picks checkpoints for the wrong reason), and the
+                # ground-truth-intent action loss cannot see the degradation that matters at inference.
+                crit = e[3] if args.select == "chain" else e[2]
+                if crit < best:
+                    best = crit
                     torch.save(ck_out, out / "best.pt")
-                    print(f"  [eval] new best test action loss {best:.4f}", flush=True)
+                    print(f"  [eval] new best test {args.select} loss {best:.4f}", flush=True)
                 (out / "history.json").write_text(json.dumps(hist, indent=1))
 
-    print(f"done, {step} steps in {(time.time() - t0) / 60:.1f} min, best test action loss {best:.4f}")
+    print(f"done, {step} steps in {(time.time() - t0) / 60:.1f} min, best test {args.select} loss {best:.4f}")
 
 
 if __name__ == "__main__":

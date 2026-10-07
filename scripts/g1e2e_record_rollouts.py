@@ -81,7 +81,42 @@ PROPRIO_DIM = 51
 ACTION_DIM = 21
 TOKEN_DIM = PROPRIO_DIM + ACTION_DIM
 CONTROL_HZ = 50        # sim dt 0.005 x decimation 4; asserted against the env below
-REF_FPS = 30           # the motion library's keyframe rate
+REF_FPS = None         # per-clip, 30/31.25/33.33 (source rate / integer stride); recorded in the refs, not a constant here
+
+# The teacher's REFERENCE block, the only exogenous input it has and the one thing the first version of
+# this recorder threw away. Layout of the 1821-d observation the student consumes
+# (legged_robot.py:1090-1102, obs version "v-teleop-extend-vr-max-nolinvel"):
+#     dof_pos 21 | dof_vel 21 | base_ang_vel 3 | projected_gravity 3 | task_obs 27 | actions 21 | history 1725
+# so task_obs lives at [48:75]. It is 3 virtual points (left hand = left_elbow +0.2x, right hand, head =
+# pelvis +0.45z; config_eval.yaml:23 sets teleop_selected_keypoints_names to [] so only the three extends
+# are tracked) x (reference-minus-robot position 3 | reference-minus-root position 3 | reference velocity
+# 3), all in the robot's heading frame, sampled ONE control step ahead (legged_robot.py:866-868).
+# Taken from obs_buf rather than recomputed: that is literally what the teacher saw, including any
+# randomize_motion_ref_xyz perturbation. config_eval sets add_noise False and clip_observations 100, and
+# these are metre-scale position differences, so no noise is added and the clip never binds.
+# It cannot be fed to the policy at test time -- there is no reference then, that is the task -- but it
+# can be a PREDICTION TARGET (more direct than the current future-proprio intent) or the privileged
+# input of a teacher-student distillation, which is how this tracker itself was produced.
+REF_OBS_DIM = 27
+REF_OBS_SLICE = slice(48, 75)
+SELF_OBS_DIM = 48      # dof_pos 21 + dof_vel 21 + base_ang_vel 3 + gravity 3, the block before task_obs
+
+# The randomisations the TEACHER WAS TRAINED UNDER, transcribed from
+# legged_gym/cfg/cfg_g1/domain_rand/domain_rand_teleop.yaml, which config_eval.yaml:56-65 switches off.
+# Re-enabling exactly these keeps every pass in-distribution for the tracker while making the passes
+# differ. `randomize_friction` and `randomize_base_mass` stay off because the teacher's own config has
+# them off ("replaced by randomize_link_mass").
+# Note config_eval.yaml:63 reads `andomize_base_com` -- a typo, missing the r -- so base-CoM
+# randomisation was never actually disabled there; it is listed here so the setting is explicit.
+DR_ON = [
+    "domain_rand.push_robots=True", "domain_rand.push_interval_s=5", "domain_rand.max_push_vel_xy=1.0",
+    "domain_rand.randomize_base_com=True",
+    "domain_rand.randomize_link_mass=True",
+    "domain_rand.randomize_pd_gain=True",
+    "domain_rand.randomize_torque_rfi=True", "domain_rand.randomize_rfi_lim=True",
+    "domain_rand.randomize_ctrl_delay=True", "domain_rand.ctrl_delay_step_range=[0,3]",
+    "domain_rand.randomize_motion_ref_xyz=True",
+]
 
 
 def main():
@@ -96,6 +131,19 @@ def main():
                     help="mean-body reference-distance limit; 0.5 is the authors' own success criterion")
     ap.add_argument("--keep-failed", action="store_true",
                     help="keep terminated episodes too (truncated at termination); off by default, as MIND does")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="passes over the whole library. >1 only produces different trajectories if "
+                         "--domain-rand is on: under config_eval every randomisation is off, "
+                         "init_noise_std is 0.001 and env.test starts each clip from the same frame, so "
+                         "N passes would give N nearly identical rollouts. Clips from pass r>0 are keyed "
+                         "'<clip>#r'.")
+    ap.add_argument("--domain-rand", action="store_true",
+                    help="restore the randomisations the TEACHER WAS TRAINED UNDER "
+                         "(domain_rand/domain_rand_teleop.yaml), which config_eval switches off: pushes, "
+                         "link mass, base CoM, PD gains, torque RFI, control delay, and the reference-xyz "
+                         "jitter. Not arbitrary noise -- it is the distribution the tracker was robustified "
+                         "against, so it stays in-distribution for the teacher while giving each pass a "
+                         "different trajectory.")
     ap.add_argument("--policy-ckpt", default="", help="on-policy hook: our own policy, for DAgger")
     ap.add_argument("--mix-prob", type=float, default=0.0, help="probability of executing our action instead")
     ap.add_argument("--device", default="cuda:0")
@@ -134,7 +182,8 @@ def main():
         cfg_hydra = hydra.compose(config_name="config_eval", overrides=[
             f"motion.motion_file={refs}", f"num_envs={args.num_envs}", f"sim_device={args.device}",
             f"load_run={args.load_run}", "headless=True", "use_wandb=False",
-            f"asset.termination_scales.max_ref_motion_distance={args.ref_dist}", *overrides])
+            f"asset.termination_scales.max_ref_motion_distance={args.ref_dist}",
+            *(DR_ON if args.domain_rand else []), *overrides])
     cfg = EasyDict(OmegaConf.to_container(cfg_hydra, resolve=True))
     cfg.physics_engine = gymapi.SIM_PHYSX
 
@@ -148,18 +197,41 @@ def main():
     assert abs(1.0 / env.dt - CONTROL_HZ) < 0.1, (
         f"env control rate is {1.0 / env.dt:.3f} Hz, not the {CONTROL_HZ} Hz this recorder labels its data "
         f"with; fix CONTROL_HZ or the config, do not let the two disagree")
+    # The reference slice is positional, so pin the layout it was derived from. If the obs version or the
+    # tracked-keypoint list changes, task_obs moves and a silent slice would record the wrong 27 numbers.
+    n_obs = int(cfg.env.num_observations)
+    n_hist_block = int(cfg.env.short_history_length) * (int(cfg.extra.dof_num) * 3 + 6) \
+        if cfg.env.add_short_history else 0
+    expect = SELF_OBS_DIM + REF_OBS_DIM + ACTION_DIM + n_hist_block
+    assert n_obs == expect, (
+        f"observation layout moved: config says num_observations={n_obs}, the layout this recorder's "
+        f"REF_OBS_SLICE={REF_OBS_SLICE} assumes gives {expect} "
+        f"(self {SELF_OBS_DIM} + task_obs {REF_OBS_DIM} + actions {ACTION_DIM} + history {n_hist_block}). "
+        f"Re-derive the slice from legged_robot.py before recording.")
+    assert cfg.motion.teleop_obs_version == "v-teleop-extend-vr-max-nolinvel", (
+        f"REF_OBS_SLICE was derived for obs version 'v-teleop-extend-vr-max-nolinvel', this run uses "
+        f"{cfg.motion.teleop_obs_version!r}")
+    print(f"reference block: obs[{REF_OBS_SLICE.start}:{REF_OBS_SLICE.stop}] of {n_obs}, "
+          f"{REF_OBS_DIM}-d, domain_rand={'on' if args.domain_rand else 'off'}, repeats={args.repeats}")
+
     print(f"motions {n_motions}   envs {args.num_envs}   "
           f"action_scale {cfg.control.action_scale}   ref-distance limit "
           f"{cfg.asset.termination_scales.max_ref_motion_distance} m")
 
     # Walk the library sequentially, one motion per env, exactly as OnPolicyRunner.eval() does.
     env.cfg.env.test = True
-    env.begin_seq_motion_samples()
-    obs, _ = env.reset()
-
-    data, n_fail, n_done = {}, 0, 0
+    data, n_fail = {}, 0
     t0 = time.time()
-    while n_done < n_motions:
+    for rep in range(max(1, args.repeats)):
+      # Each pass re-seeds, so the randomisations and the init noise differ; with --domain-rand off the
+      # passes are near-duplicates and --repeats > 1 is pointless (see the flag's help).
+      torch.manual_seed(1000 + rep)
+      np.random.seed(1000 + rep)
+      env.begin_seq_motion_samples()
+      obs, _ = env.reset()
+      n_done = 0
+      print(f"=== pass {rep + 1}/{max(1, args.repeats)} ===", flush=True)
+      while n_done < n_motions:
         ids = lib._curr_motion_ids.clone()
         keys = [str(k) for k in lib._motion_data_keys[ids.cpu().numpy()]]
         # get_motion_num_steps() counts in 30 Hz units (num_frames * 30 / motion_fps) while the env steps
@@ -183,6 +255,7 @@ def main():
         mpjpe_n = torch.zeros(env.num_envs, dtype=torch.float64)
         prop = torch.zeros((horizon, env.num_envs, PROPRIO_DIM), dtype=torch.float32)
         act = torch.zeros((horizon, env.num_envs, ACTION_DIM), dtype=torch.float32)
+        ref = torch.zeros((horizon, env.num_envs, REF_OBS_DIM), dtype=torch.float32)
         length = torch.zeros(env.num_envs, dtype=torch.long)
         failed = torch.zeros(env.num_envs, dtype=torch.bool)
         # `horizon` is the LONGEST motion in the batch, so a short clip's env keeps stepping after its own
@@ -197,6 +270,9 @@ def main():
             # trained on this has to reproduce.
             prop[t] = torch.cat([env.base_lin_vel, env.base_ang_vel, env.projected_gravity,
                                  env.dof_pos, env.dof_vel], dim=-1).detach().cpu()
+            # The reference block the teacher is about to act on, from the SAME observation tensor it is
+            # about to be given, so it is aligned with act[t] by construction.
+            ref[t] = obs.detach()[:, REF_OBS_SLICE].cpu()
             with torch.inference_mode():
                 a = policy(obs.detach())
             act[t] = a.detach().cpu()
@@ -221,7 +297,11 @@ def main():
                 break
 
         for i, key in enumerate(keys):
-            if key in data or key not in text_index:
+            # One entry per (clip, pass). `base_key` is what the text cache and the reference library are
+            # keyed by; `key` carries the pass so repeats do not overwrite each other. The dataset must
+            # look captions up by base_key, not by the dict key.
+            dkey = key if rep == 0 else f"{key}#{rep}"
+            if dkey in data or key not in text_index:
                 continue
             L = min(int(length[i]), int(steps_cpu[i]))
             if L < 20:
@@ -230,9 +310,12 @@ def main():
                 n_fail += 1
                 continue
             n_fail += int(bool(failed[i]))
-            data[key] = dict(
+            data[dkey] = dict(
                 proprio=prop[:L, i].numpy().astype(np.float32),
                 action=act[:L, i].numpy().astype(np.float32),
+                ref_obs=ref[:L, i].numpy().astype(np.float32),
+                base_key=key,
+                rep=rep,
                 failed=bool(failed[i]),
                 mpjpe_mean_m=float(mpjpe_sum[i] / mpjpe_n[i]) if float(mpjpe_n[i]) > 0 else float("nan"),
                 n_frames=L,
@@ -259,6 +342,10 @@ def main():
                 minutes=frames / CONTROL_HZ / 60, proprio_dim=PROPRIO_DIM, action_dim=ACTION_DIM,
                 token_dim=TOKEN_DIM, action_scale=float(cfg.control.action_scale),
                 control_hz=CONTROL_HZ, ref_fps=REF_FPS,
+                # The dataset needs these to build the HOLD ACTION for its start-rest windows:
+                # a = (dof_pos - default_dof_pos) / action_scale is the action whose PD target is the
+                # robot's current pose. Only the env has default_dof_pos, so it travels with the data.
+                default_dof_pos=env.default_dof_pos[0].detach().cpu().numpy().tolist(),
                 tracker=args.load_run, refs=str(refs),
                 ref_distance_limit=float(cfg.asset.termination_scales.max_ref_motion_distance),
                 ref_distance_is_mean_over_bodies=True, action_is_pre_ema=True,

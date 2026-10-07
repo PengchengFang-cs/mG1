@@ -39,14 +39,26 @@ def generated_elements(observed_mask, valid, act_mask):
     return fut[..., None] * act_mask[None, None]
 
 
-def policy_input(x0, observed_mask, act_mask):
-    """Zero the non-action channels of the future rows: never generated, never shown.
+def policy_input(x0, observed_mask, act_mask, n_future_proprio=0):
+    """Zero the proprio channels of the future rows the closed loop cannot observe.
 
-    This is the same guard `G1E2EWindows.mask_future_proprio` applies when building a window; doing it here
-    too means a window built with obs_future="all" (for a diagnostic) still cannot leak into the loss path.
+    `n_future_proprio` is how many future rows keep their proprio, and it MUST match the dataset's
+    `obs_future` ("first" -> 1, "none" -> 0). Row H is the state the loop IS in when it plans: with our
+    recorder's pairing (row t = state the action was applied in, g1e2e_record_rollouts.py:196-199) the
+    action to emit is a_H, which is applied in s_H, so withholding row H's proprio leaves the policy
+    predicting a feedback controller's output 40-160 ms ahead of the state that controller reacts to.
+
+    An earlier version took no such argument and zeroed EVERY row with observed_mask == 0, row H
+    included. That made `obs_future="first"` bit-identical to `"none"` and destroyed the one channel
+    `G1E2EWindows.mask_future_proprio` deliberately keeps; the closed loop zeroed it too, so training and
+    inference agreed on the broken version and no mismatch check could find it. Three independent code
+    reviews on 2026-10-02 identified it as the primary defect behind 512/512 falls.
     """
-    fut = (1.0 - observed_mask)[..., None]
-    return x0 * (1.0 - fut * (1.0 - act_mask[None, None]))
+    fut = 1.0 - observed_mask
+    # cumsum over the future rows numbers them 1, 2, 3, ...; keep the first n, zero the rest. Done with
+    # tensor ops rather than an int(H) so there is no device sync in the training loop.
+    zero_prop = fut * (fut.cumsum(1) > n_future_proprio).to(x0.dtype)
+    return x0 * (1.0 - zero_prop[..., None] * (1.0 - act_mask[None, None]))
 
 
 def build_state_elem(x0, gen, t, noise=None, generator=None):

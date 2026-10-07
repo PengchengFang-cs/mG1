@@ -6,6 +6,7 @@ computed against a SMPL target rotated by the same amount (hml_phys/g1_retarget.
 """
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -20,17 +21,42 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--splits", default="train,test")
+    ap.add_argument("--shards", default="",
+                    help="merge only these shard indices, e.g. '0-9' or '0,1,2'. Lets the finished half "
+                         "of a two-card build be merged and recorded while the other half is still "
+                         "running -- recording is per-clip independent, so there is no reason to idle a "
+                         "free card. Default: every shard present.")
+    ap.add_argument("--name", default="",
+                    help="output stem instead of refs_<split>, e.g. 'refs_train_part1'. Required with "
+                         "--shards so a partial merge cannot overwrite the full library.")
     args = ap.parse_args()
+    want = None
+    if args.shards:
+        want = set()
+        for piece in args.shards.split(","):
+            if "-" in piece:
+                lo, hi = piece.split("-")
+                want.update(range(int(lo), int(hi) + 1))
+            else:
+                want.add(int(piece))
+        assert args.name, "--shards needs --name, so a partial merge cannot overwrite refs_<split>.pkl"
     d = Path(args.out_dir).resolve()
 
     from hml_phys.g1_retarget import check_upright
 
     summary = {}
     for split in args.splits.split(","):
-        # The builder writes a sibling `<stem>.skipped.pkl` next to each shard; a bare *.pkl glob picks
-        # those up and then looks for a .text.json that was never written for them.
+        # The builder writes siblings next to each shard: `<stem>.skipped.pkl` and, while a shard is
+        # still running or after it was killed, `<stem>.part.pkl` (the resume checkpoint). A bare *.pkl
+        # glob picks both up; the .part one would then be merged with its keys "lib"/"text"/"skipped"
+        # treated as clip ids, which is the one path that can silently corrupt the merged library.
         shards = sorted(q for q in d.glob(f"refs_{split}_shard*.pkl")
-                        if not q.name.endswith(".skipped.pkl"))
+                        if not q.name.endswith((".skipped.pkl", ".part.pkl", ".part.pkl.tmp")))
+        if want is not None:
+            shards = [q for q in shards
+                      if int(re.search(r"shard(\d+)\.pkl$", q.name).group(1)) in want]
+            missing = want - {int(re.search(r"shard(\d+)\.pkl$", q.name).group(1)) for q in shards}
+            assert not missing, f"--shards asked for {sorted(missing)} but those {split} shards are absent"
         assert shards, f"no shards for {split} in {d}"
         lib, text = {}, {}
         for s in shards:
@@ -52,14 +78,18 @@ def main():
         print(f"    world frame: head-above-pelvis {stats['head_above_pelvis_median']:.3f} m, "
               f"upright {stats['frac_upright']:.3f}, lowest foot {stats['lowest_foot_median']:.3f} m  OK")
 
-        joblib.dump(lib, d / f"refs_{split}.pkl")
-        (d / f"refs_{split}.text.json").write_text(json.dumps(text, ensure_ascii=False, indent=1))
+        stem = args.name or f"refs_{split}"
+        joblib.dump(lib, d / f"{stem}.pkl")
+        (d / f"{stem}.text.json").write_text(json.dumps(text, ensure_ascii=False, indent=1))
         summary[split] = dict(clips=len(lib), frames=int(frames.sum()),
                               minutes=float(frames.sum() / 30 / 60), captions=caps,
                               fit_err_m=float(errs.mean()), **stats)
 
-    (d / "refs_summary.json").write_text(json.dumps(summary, indent=2))
-    print(f"\nwrote refs_{{{args.splits}}}.pkl + .text.json + refs_summary.json in {d}")
+    # A partial merge must not overwrite the full build's summary either.
+    sfile = f"{args.name}_summary.json" if args.name else "refs_summary.json"
+    (d / sfile).write_text(json.dumps(summary, indent=2))
+    stem = args.name or f"refs_{{{args.splits}}}"
+    print(f"\nwrote {stem}.pkl + .text.json + {sfile} in {d}")
 
 
 if __name__ == "__main__":

@@ -58,7 +58,10 @@ def main():
     from hml_phys.g1e2e_data import G1E2EStateSeq, PROPRIO_DIM, compute_stats
     from hml_phys.intent_vae import IntentVAE, sigma_vae_nll
 
-    down = args.down_t ** 2
+    # intent_vae.py:114 is `self.down = stride_t ** down_t`. `down_t ** 2` coincides only at the
+    # default down_t=2, stride_t=2; with --down-t 3 this computed 9 against the model's 8, so the
+    # `assert L % down == 0` guard rejected the correct L and stage 2 read a different latent length.
+    down = 2 ** args.down_t
     tr = G1E2EStateSeq(args.rollouts, args.L, gen_hz=args.gen_hz, max_clips=args.max_clips, down=down)
     # test reuses train's statistics; recomputing them per split would leak the eval distribution in
     te = G1E2EStateSeq(args.rollouts_eval, args.L, gen_hz=args.gen_hz, down=down,
@@ -108,6 +111,17 @@ def main():
             # against a KL summed over (latent time, latent dim) and meaned over the batch only.
             # Dividing the NLL per element while meaning the KL over latent time rescaled their ratio by
             # B*T*C/T' = 26112, so `--kl 1e-5` stopped meaning MIND's lambda_KL = 1e-5 at all.
+            # KEEP the `/ x.shape[0]`, and keep `--kl 1e-5` meaning what it means HERE, not what the
+            # same flag means in the reference. The two are not interchangeable: the reference's
+            # `l_rec = sigma_vae_nll(pred, x)` has no division (train_intent_vae.py:128-130), and a code
+            # review on 2026-10-02 flagged the difference -- but ranked it "probably not the cause",
+            # because this VAE was healthy (test MSE 0.04137, 32/32 latent dims active, KL 295 nats).
+            # Removing the division anyway was measured on 2026-10-03 and made stage 1 strictly worse:
+            # at step 32000, test MSE 0.27790 against 0.04312, KL 1468 against 333, mu_abs 5.87 against
+            # 1.94. Scaling the NLL by B while the KL stays per-sample weakens the KL by B = 128, so
+            # `--kl 1e-5` became an effective 7.8e-8 and the posterior ran away; grad_clip=1.0 also
+            # rescales the step once the loss is 128x larger. The reference's footing is right for the
+            # reference's batch size, LR and clip; transplanting the expression alone is not.
             rec = sigma_vae_nll(xr, x) / x.shape[0]
             kl = (-0.5 * (1 + lv - mu ** 2 - lv.exp())).sum([1, 2]).mean()
             loss = rec + args.kl * kl

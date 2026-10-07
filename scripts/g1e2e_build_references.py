@@ -56,6 +56,11 @@ def main():
     ap.add_argument("--nshards", type=int, default=1)
     ap.add_argument("--max-iter", type=int, default=1000, help="Adam steps per clip (their default)")
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--checkpoint-every", type=int, default=25,
+                    help="write partial shard state every N clips, so a wall-clock kill costs at most "
+                         "that many clips instead of the whole shard")
+    ap.add_argument("--restart", action="store_true",
+                    help="ignore any existing .part.pkl and start this shard from scratch")
     args = ap.parse_args()
 
     out = Path(args.out).resolve()
@@ -98,8 +103,29 @@ def main():
 
     from tqdm import tqdm
     lib, text, skipped = {}, {}, {}
+    # Checkpoint / resume. A shard takes hours and the allocation has a wall clock: on 2026-10-02 the job
+    # hit its 2d12h limit with 20 shards at 23% and every one of them lost everything, because the shard
+    # pkl was only written at the end. Partial state now lands every --checkpoint-every clips and a
+    # restart skips what is already there.
+    part = out.with_suffix(".part.pkl")
+    if part.exists() and not args.restart:
+        done = joblib.load(part)
+        lib, text, skipped = done["lib"], done["text"], done["skipped"]
+        print(f"resuming from {part.name}: {len(lib)} retargeted, {len(skipped)} skipped already")
+    seen = set(lib) | set(skipped)
+    clips = [c for c in clips if c["name"] not in seen]
+    if seen:
+        print(f"{len(clips)} clips left to do")
+
+    def checkpoint():
+        tmp = part.with_suffix(".tmp")
+        joblib.dump(dict(lib=lib, text=text, skipped=skipped), tmp)
+        tmp.replace(part)       # atomic: a kill mid-write leaves the previous checkpoint intact
+
     t0 = time.time()
-    for c in tqdm(clips, desc=f"retarget {args.split}"):
+    for n_done, c in enumerate(tqdm(clips, desc=f"retarget {args.split}"), 1):
+        if n_done % args.checkpoint_every == 0:
+            checkpoint()
         npz = amass_path(c["source_file"])
         if not npz.exists():
             skipped[c["name"]] = f"missing AMASS file {npz.name}"
@@ -159,6 +185,7 @@ def main():
     joblib.dump(lib, out)
     out.with_suffix(".text.json").write_text(json.dumps(text, ensure_ascii=False, indent=1))
     joblib.dump(skipped, out.with_suffix(".skipped.pkl"))
+    part.unlink(missing_ok=True)        # the shard is complete; the resume state is no longer needed
     print(f"wrote {out}  ({out.stat().st_size / 1e6:.0f} MB)")
     print(f"      {out.with_suffix('.text.json').name}")
 
