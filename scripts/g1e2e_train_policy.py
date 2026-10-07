@@ -25,6 +25,7 @@ loop, not from this loss.
 """
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -95,6 +96,24 @@ def main():
                     help="latent rows sampled to measure the intent-latent normalisation")
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--intent-target", default="proprio", choices=["proprio", "ref"],
+                    help="what HIP and IIP are trained to predict. 'proprio' (the default so far) is the "
+                         "encoding of the next H / whole-clip PROPRIO rows -- what the body ends up at. "
+                         "'ref' is the encoding of the teacher's 27-d reference block, i.e. the control "
+                         "TARGET the teacher was tracking, which is closer to what 'intent' means and is "
+                         "the one input the teacher had that the first recording threw away. Needs "
+                         "--vae-ref and rollouts recorded with ref_obs. The history prefix stays on the "
+                         "proprio VAE either way: the history is observable, the reference never is.")
+    ap.add_argument("--vae-ref", default="",
+                    help="frozen VAE over the 27-d reference block, from g1e2e_train_vae.py --field ref")
+    ap.add_argument("--lr-schedule", default="const", choices=["const", "cosine"],
+                    help="cosine: linear warm-up then half-cosine decay to lr*lr_final_ratio by --steps, "
+                         "the same form the reference uses (train_intent_policy.py:102-114). The G1 side "
+                         "only ever ran const, and on the full data `act_chain` bottoms at step 10000 and "
+                         "then rises monotonically to 100k -- the run drifts past its own optimum.")
+    ap.add_argument("--lr-final-ratio", type=float, default=0.01)
+    ap.add_argument("--lr-warmup", type=int, default=2000,
+                    help="reference default; MoGeFlow / MoMask / MotionStreamer all use 2000")
     ap.add_argument("--wd", type=float, default=0.01)
     ap.add_argument("--steps", type=int, default=200000)
     ap.add_argument("--eval-every", type=int, default=5000)
@@ -135,12 +154,14 @@ def main():
     tr = G1E2EWindows(args.rollouts, tc, args.H, args.F, gen_hz=args.gen_hz,
                       stride=args.window_stride, obs_future=args.obs_future, max_clips=args.max_clips,
                       stats=stats, seed=args.seed, p_rest=args.p_rest, holi_aug=True,
-                      p_holi_exact=args.p_holi_exact, max_mpjpe=args.max_mpjpe)
+                      p_holi_exact=args.p_holi_exact, max_mpjpe=args.max_mpjpe,
+                      want_ref=(args.intent_target == "ref"))
     # The test set takes NO augmentation: the selection criterion must only move when the weights move.
     te = G1E2EWindows(args.rollouts_eval, tc, args.H, args.F, gen_hz=args.gen_hz,
                       stride=max(1, args.H), obs_future=args.obs_future,
                       stats=stats, seed=args.seed + 1, deterministic_caption=True,
-                      p_rest=0.0, holi_aug=False, max_mpjpe=args.max_mpjpe)
+                      p_rest=0.0, holi_aug=False, max_mpjpe=args.max_mpjpe,
+                      want_ref=(args.intent_target == "ref"))
     print(f"train {json.dumps(describe(tr))}")
     print(f"test  {json.dumps(describe(te))}")
     np.savez(out / "stats.npz", mean=tr.mean, std=tr.std, gen_hz=args.gen_hz, H=args.H, F=args.F)
@@ -152,6 +173,31 @@ def main():
                     depth=va["depth"], dilation_growth_rate=va["dilation"], latent_dim=va["latent"]).to(dev)
     vae.load_state_dict(ck["model"])
     vae.eval().requires_grad_(False)
+
+    # Optional second frozen VAE over the teacher's reference block, used ONLY to define what the intent
+    # predictors aim at (--intent-target ref). Its latent shape must match the proprio VAE's, because the
+    # IIP conditions on a proprio-latent prefix and predicts in the same latent geometry.
+    tvae = None
+    if args.intent_target == "ref":
+        assert args.vae_ref, "--intent-target ref needs --vae-ref"
+        tck = torch.load(args.vae_ref, map_location="cpu")
+        ta_ = tck["args"]
+        tvae = IntentVAE(input_dim=tck["input_dim"], width=ta_["width"], down_t=ta_["down_t"], stride_t=2,
+                         depth=ta_["depth"], dilation_growth_rate=ta_["dilation"],
+                         latent_dim=ta_["latent"]).to(dev)
+        tvae.load_state_dict(tck["model"])
+        tvae.eval().requires_grad_(False)
+        ref_field = tck.get("field")
+        assert ref_field == "ref", (
+            f"--vae-ref must be a VAE trained with --field ref; this one says {ref_field!r}")
+        assert tvae.down == vae.down and tvae.latent_dim == vae.latent_dim, (
+            f"ref VAE latent geometry {tvae.down}/{tvae.latent_dim} differs from the proprio VAE's "
+            f"{vae.down}/{vae.latent_dim}; the IIP predicts in one geometry only")
+        # Look the key up OUTSIDE the f-string. An earlier version built it with chr() to dodge quoting
+        # inside a shell heredoc, which produced the literal key "'input_dim'" (quotes included) and
+        # killed both reference-target arms with KeyError at load time, after the ref VAE had trained.
+        ref_in = tck["input_dim"]
+        print(f"ref VAE: input {ref_in}, latent {tvae.latent_dim}, down {tvae.down}")
     assert ck["input_dim"] == PROPRIO_DIM, f"VAE expects {ck['input_dim']}-d state, G1 proprio is {PROPRIO_DIM}"
     assert va["gen_hz"] == args.gen_hz, (
         f"the VAE was trained at {va['gen_hz']} Hz and this run uses {args.gen_hz}; the latents encode "
@@ -181,6 +227,23 @@ def main():
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     act_mask = action_channel_mask(dev)
+
+    def set_lr(step):
+        """Constant, or linear warm-up then half-cosine decay to lr*lr_final_ratio by --steps.
+
+        Transcribed from train_intent_policy.py:102-114. `step` is the step ABOUT TO BE TAKEN, so this is
+        called after the optimiser step counter increments, as the reference does."""
+        if args.lr_schedule == "const":
+            return args.lr
+        if step <= args.lr_warmup:
+            lr = args.lr * step / max(args.lr_warmup, 1)
+        else:
+            prog = min(1.0, (step - args.lr_warmup) / max(args.steps - args.lr_warmup, 1))
+            lr = args.lr * (args.lr_final_ratio
+                            + (1 - args.lr_final_ratio) * 0.5 * (1 + math.cos(math.pi * prog)))
+        for g in opt.param_groups:
+            g["lr"] = lr
+        return lr
     # How many future rows keep their proprio. This has to agree with the dataset's obs_future, and it is
     # what `policy_input` was silently overriding: row H is the state the loop is in when it plans.
     n_fut_prop = {"none": 0, "first": 1, "all": args.F}[args.obs_future]
@@ -230,6 +293,39 @@ def main():
     def norm_lat(v):
         return (v - lat_mean) / lat_std
 
+    # The REF latents need their own normaliser: they come from a different encoder over a different
+    # quantity, so the proprio VAE's latent statistics do not describe them. Same bounded, shuffled
+    # sample, same cache-in-the-output-directory discipline.
+    tlat_mean = tlat_std = None
+    if tvae is not None:
+        tpath = out / "ref_latent_stats.npz"
+        if tpath.exists():
+            z = np.load(tpath)
+            tlat_mean = torch.tensor(z["mean"], device=dev)
+            tlat_std = torch.tensor(z["std"], device=dev)
+        else:
+            from torch.utils.data import DataLoader as _DL
+            acc = []
+            _g2 = torch.Generator().manual_seed(args.seed + 7)
+            with torch.no_grad():
+                for b in _DL(tr, batch_size=256, shuffle=True, num_workers=2, generator=_g2):
+                    for fld in ("fut_ref", "holi_ref"):
+                        _, mu, _ = tvae.encode(b[fld].to(dev))
+                        acc.append(mu.reshape(-1, mu.shape[-1]).cpu())
+                    if sum(a.shape[0] for a in acc) > args.lat_stat_rows:
+                        break
+            A = torch.cat(acc)
+            tlat_mean = A.mean(0).to(dev)
+            tlat_std = A.std(0).clamp_min(1e-3).to(dev)
+            np.savez(tpath, mean=tlat_mean.cpu().numpy(), std=tlat_std.cpu().numpy(),
+                     rows=int(A.shape[0]))
+        print(f"ref latents: |mean| {float(tlat_mean.abs().mean()):.3f}  "
+              f"std {float(tlat_std.mean()):.3f} (min {float(tlat_std.min()):.3f}, "
+              f"max {float(tlat_std.max()):.3f})")
+
+    def norm_tlat(v):
+        return (v - tlat_mean) / tlat_std
+
     # The unconditional text state is CLIP(''), cached once, not a zeroed caption: zeroing leaves a state
     # that depends on the dropped caption's length, so classifier-free guidance has no fixed point to
     # extrapolate from (and the policy's own mask, rebuilt from the real length in part_model.py:160,
@@ -246,8 +342,12 @@ def main():
     print(f"unconditional CLIP(''): {unc_len} tokens")
 
     def batch_to_dev(b):
+        # fut_ref / holi_ref are present only when the dataset was built with want_ref; they are the
+        # --intent-target ref targets and are None otherwise.
         return (b["x"].to(dev), b["fut"].to(dev), b["holi"].to(dev), b["text"].to(dev).float(),
-                b["text_pooled"].to(dev).float(), b["text_len"].to(dev), b["scal"].to(dev))
+                b["text_pooled"].to(dev).float(), b["text_len"].to(dev), b["scal"].to(dev),
+                b["fut_ref"].to(dev) if "fut_ref" in b else None,
+                b["holi_ref"].to(dev) if "holi_ref" in b else None)
 
     def hidden_level(B, train, gen=None):
         """Noise level at which the intent hidden states are read. MIND augments the conditioning with
@@ -258,7 +358,8 @@ def main():
             return float(args.cond_aug_test)
         return args.cond_aug + (1.0 - args.cond_aug) * torch.rand(B, device=dev, generator=gen)
 
-    def losses(x, fut, holi, text, text_pooled, text_len, scal, train=True, gen=None):
+    def losses(x, fut, holi, text, text_pooled, text_len, scal, fut_ref=None, holi_ref=None,
+               train=True, gen=None):
         B, T, _ = x.shape
         obs = observed_mask(B, args.H, T, dev)
         gmask = generated_elements(obs, None, act_mask)
@@ -268,10 +369,23 @@ def main():
         # (train_intent_policy.py:132). CausalEncoder's first return is mu + randn*sigma, and that draw is
         # not generator-controlled, so using it would also inject unseeded noise into the eval loss.
         with torch.no_grad():
+            # The HISTORY prefix always comes from the proprio VAE: the history is what the loop can
+            # actually observe. Only the TARGETS change with --intent-target.
             _, mu_hist, _ = vae.encode(x[:, :args.H, :PROPRIO_DIM])
-            _, mu_fut, _ = vae.encode(fut)
-            _, mu_holi, _ = vae.encode(holi)
-            lat_hist, lat_fut, lat_holi = norm_lat(mu_hist), norm_lat(mu_fut), norm_lat(mu_holi)
+            lat_hist = norm_lat(mu_hist)
+            if tvae is None:
+                _, mu_fut, _ = vae.encode(fut)
+                _, mu_holi, _ = vae.encode(holi)
+                lat_fut, lat_holi = norm_lat(mu_fut), norm_lat(mu_holi)
+            else:
+                # --intent-target ref: the intents aim at the teacher's own CONTROL TARGET rather than at
+                # the proprio the robot will happen to reach. Closer to what "intent" means -- what the
+                # motion is trying to do, not what the body ends up at -- and it is the one input the
+                # teacher had that our recording used to throw away. It stays a target only: at inference
+                # there is no reference at any time, which is the task.
+                _, mu_fut, _ = tvae.encode(fut_ref)
+                _, mu_holi, _ = tvae.encode(holi_ref)
+                lat_fut, lat_holi = norm_tlat(mu_fut), norm_tlat(mu_holi)
 
         # One dropout mask shared by all three heads. A dropped sample is replaced by the cached CLIP('')
         # tokens, length AND pooled vector, giving a single well-defined unconditional state.
@@ -378,8 +492,8 @@ def main():
             for nb, b in enumerate(el):
                 if args.eval_batches and nb >= args.eval_batches:
                     break
-                x, fut, holi, text, pooled, tlen, scal = batch_to_dev(b)
-                ls = losses(x, fut, holi, text, pooled, tlen, scal, train=False, gen=eg)
+                x, fut, holi, text, pooled, tlen, scal, fut_ref, holi_ref = batch_to_dev(b)
+                ls = losses(x, fut, holi, text, pooled, tlen, scal, fut_ref, holi_ref, train=False, gen=eg)
                 ch = chain_action_loss(x, fut, holi, text, pooled, tlen, scal, eg)
                 acc += np.array([float(v) for v in ls] + [float(ch)]) * x.shape[0]
                 n += x.shape[0]
@@ -393,8 +507,8 @@ def main():
         for b in tl:
             if step >= args.steps:
                 break
-            x, fut, holi, text, pooled, tlen, scal = batch_to_dev(b)
-            l_hip, l_iip, l_act = losses(x, fut, holi, text, pooled, tlen, scal)
+            x, fut, holi, text, pooled, tlen, scal, fut_ref, holi_ref = batch_to_dev(b)
+            l_hip, l_iip, l_act = losses(x, fut, holi, text, pooled, tlen, scal, fut_ref, holi_ref)
             loss = l_hip + l_iip + l_act                      # MIND eq. 5, equal weights
             if not torch.isfinite(loss):
                 raise SystemExit(
@@ -405,6 +519,7 @@ def main():
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+            cur_lr = set_lr(step + 1)       # the schedule applies to the step about to be taken
             step += 1
             if ema is not None and step % args.ema_every == 0:
                 with torch.no_grad():
@@ -416,7 +531,7 @@ def main():
             if step % args.log_every == 0:
                 print(f"step {step} loss={float(loss):.4f} hip={float(l_hip):.4f} "
                       f"iip={float(l_iip):.4f} act={float(l_act):.4f} gn={float(gn):.2f} "
-                      f"{(time.time() - t0) / step * 1000:.0f}ms/it", flush=True)
+                      f"lr={cur_lr:.2e} {(time.time() - t0) / step * 1000:.0f}ms/it", flush=True)
             if step % args.eval_every == 0 or step == args.steps:
                 e = evaluate()
                 hist.append(dict(step=step, hip=e[0], iip=e[1], act=e[2], act_chain=e[3],

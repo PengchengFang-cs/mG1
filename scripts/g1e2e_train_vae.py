@@ -31,6 +31,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rollouts", default="data/g1_e2e/rollouts_train.pkl")
     ap.add_argument("--rollouts-eval", default="data/g1_e2e/rollouts_test.pkl")
+    ap.add_argument("--field", default="proprio", choices=["proprio", "ref"],
+                    help="what the VAE compresses. 'proprio' = the 51-d observable state, the intent "
+                         "latent the policy conditions on. 'ref' = the teacher's 27-d reference block, "
+                         "which exists only as a PREDICTION TARGET -- at inference there is no reference "
+                         "at any time, so a ref VAE is used to define what the intent predictors aim at, "
+                         "never to encode an input.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--L", type=int, default=16, help="sequence length; MIND uses 16")
     ap.add_argument("--gen-hz", type=int, default=25, help="generation rate; 16 frames = 0.64 s at 25 Hz (20 Hz does not divide 50)")
@@ -55,18 +61,22 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    from hml_phys.g1e2e_data import G1E2EStateSeq, PROPRIO_DIM, compute_stats
+    from hml_phys.g1e2e_data import G1E2EStateSeq, PROPRIO_DIM, REF_DIM, compute_stats
     from hml_phys.intent_vae import IntentVAE, sigma_vae_nll
 
     # intent_vae.py:114 is `self.down = stride_t ** down_t`. `down_t ** 2` coincides only at the
     # default down_t=2, stride_t=2; with --down-t 3 this computed 9 against the model's 8, so the
     # `assert L % down == 0` guard rejected the correct L and stage 2 read a different latent length.
     down = 2 ** args.down_t
-    tr = G1E2EStateSeq(args.rollouts, args.L, gen_hz=args.gen_hz, max_clips=args.max_clips, down=down)
+    IN_DIM = REF_DIM if args.field == "ref" else PROPRIO_DIM
+    tr = G1E2EStateSeq(args.rollouts, args.L, gen_hz=args.gen_hz, max_clips=args.max_clips, down=down,
+                       field=args.field)
     # test reuses train's statistics; recomputing them per split would leak the eval distribution in
-    te = G1E2EStateSeq(args.rollouts_eval, args.L, gen_hz=args.gen_hz, down=down,
-                       stats=(np.concatenate([tr.mean, np.zeros(21, np.float32)]),
-                              np.concatenate([tr.std, np.ones(21, np.float32)])))
+    te = G1E2EStateSeq(args.rollouts_eval, args.L, gen_hz=args.gen_hz, down=down, field=args.field,
+                       ref_stats_in=((tr.mean, tr.std) if args.field == "ref" else None),
+                       stats=(None if args.field == "ref" else
+                              (np.concatenate([tr.mean, np.zeros(21, np.float32)]),
+                               np.concatenate([tr.std, np.ones(21, np.float32)]))))
     print(f"train {len(tr.clips)} clips / {len(tr)} windows   test {len(te.clips)} / {len(te)}")
     print(f"L {args.L} at {args.gen_hz} Hz = {args.L / args.gen_hz:.2f} s   latent {args.latent}   "
           f"downsampling {down} -> {args.L // down} latent frames")
@@ -74,9 +84,9 @@ def main():
              std_full=tr.std_full, gen_hz=args.gen_hz, L=args.L)
 
     dev = torch.device(args.device)
-    model = IntentVAE(input_dim=PROPRIO_DIM, width=args.width, down_t=args.down_t, stride_t=2,
+    model = IntentVAE(input_dim=IN_DIM, width=args.width, down_t=args.down_t, stride_t=2,
                       depth=args.depth, dilation_growth_rate=args.dilation, latent_dim=args.latent).to(dev)
-    print(f"IntentVAE {model.num_params() / 1e6:.1f} M params, input_dim {PROPRIO_DIM}")
+    print(f"IntentVAE {model.num_params() / 1e6:.1f} M params, input_dim {IN_DIM} ({args.field})")
     # weight_decay 0 and betas (0.9, 0.99), as MotionStreamer and the reference use; AdamW's default
     # 0.01 would shrink a frozen feature extractor's weights for no reason.
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0, betas=(0.9, 0.99))
@@ -146,7 +156,7 @@ def main():
                 print(f"  [eval] step {step} test MSE {e_rec:.5f}  KL {e_kl:.2f}", flush=True)
                 ck = dict(model=model.state_dict(), args=vars(args), step=step,
                           mean=tr.mean, std=tr.std, mean_full=tr.mean_full, std_full=tr.std_full,
-                          input_dim=PROPRIO_DIM)
+                          input_dim=IN_DIM, field=args.field)
                 torch.save(ck, out / "latest.pt")
                 if e_rec < best:
                     best = e_rec

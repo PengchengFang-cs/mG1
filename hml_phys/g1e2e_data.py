@@ -32,6 +32,7 @@ import torch
 from torch.utils.data import Dataset
 
 PROPRIO_DIM = 51
+REF_DIM = 27           # the teacher's reference block; see scripts/g1e2e_record_rollouts.py REF_OBS_DIM
 ACTION_DIM = 21
 TOKEN_DIM = PROPRIO_DIM + ACTION_DIM
 CONTROL_HZ = 50
@@ -60,6 +61,33 @@ def load_rollouts(path):
     if len(parts) > 1:
         print(f"rollouts: {len(parts)} files, {len(roll)} clips total")
     return roll
+
+
+def ref_stats(rollouts, gen_stride):
+    """Per-channel mean/std of the teacher's 27-d reference block, at the generation stride.
+
+    Separate from `compute_stats` because `ref_obs` is not part of the 72-d token: it is the teacher's
+    only exogenous input (reference-minus-robot positions, reference-minus-root positions and reference
+    velocities for 3 virtual points, heading frame, one control step ahead). It can never be an input to
+    our policy -- at inference there is no reference -- so it exists only as a PREDICTION TARGET, which
+    still needs unit-scale normalisation for the flow objective.
+    """
+    n, s, ss = 0, None, None
+    for v in rollouts.values():
+        r = v["ref_obs"][::gen_stride].astype(np.float64)
+        if s is None:
+            s, ss = np.zeros(r.shape[1]), np.zeros(r.shape[1])
+        n += r.shape[0]
+        s += r.sum(0)
+        ss += (r ** 2).sum(0)
+    mean = s / n
+    std = np.sqrt(np.maximum(ss / n - mean ** 2, 0.0))
+    dead = np.nonzero(std < 1e-4)[0]
+    assert dead.size == 0, (
+        f"reference channels {dead.tolist()} are constant over the recorded rollouts; the tracked "
+        f"keypoint set or the obs layout is not what REF_OBS_SLICE assumes")
+    std = np.where(std < 1e-2, 1.0, std)
+    return mean.astype(np.float32), std.astype(np.float32)
 
 
 def compute_stats(rollouts, gen_stride):
@@ -106,7 +134,7 @@ class G1E2EWindows(Dataset):
 
     def __init__(self, rollouts_path, text_cache, H, F, gen_hz=25, stride=1, stats=None,
                  obs_future="first", max_clips=0, seed=0, deterministic_caption=False,
-                 p_rest=0.1, holi_aug=True, p_holi_exact=0.25, max_mpjpe=0.0):
+                 p_rest=0.1, holi_aug=True, p_holi_exact=0.25, max_mpjpe=0.0, want_ref=False):
         assert CONTROL_HZ % gen_hz == 0, (
             f"gen_hz must divide the {CONTROL_HZ} Hz recording rate by an integer stride; {gen_hz} does "
             f"not. Available: {[h for h in range(1, CONTROL_HZ + 1) if CONTROL_HZ % h == 0]}. "
@@ -116,6 +144,7 @@ class G1E2EWindows(Dataset):
         self.H, self.F, self.gen_hz = H, F, gen_hz
         self.obs_future = obs_future
         self.p_rest = float(p_rest)
+        self.want_ref = bool(want_ref)
         self.holi_aug = bool(holi_aug)
         self.p_holi_exact = float(p_holi_exact)
         self.seed = int(seed)
@@ -157,6 +186,14 @@ class G1E2EWindows(Dataset):
         self.clips, self.windows = [], []
         self.F_fut = max(F, H)
         T = H + self.F_fut
+        if self.want_ref:
+            missing = [k for k in list(roll)[:50] if "ref_obs" not in roll[k]]
+            assert not missing, (
+                f"want_ref=True but {len(missing)} of the first 50 clips have no ref_obs (e.g. "
+                f"{missing[:2]}); this rollout file predates the reference-block recording")
+            self.ref_mean, self.ref_std = ref_stats(roll, self.gen_stride)
+            print(f"reference block: {self.ref_mean.shape[0]}-d, "
+                  f"|mean| {np.abs(self.ref_mean).mean():.3f}, std {self.ref_std.mean():.3f}")
         skipped = 0
         n_mpjpe_drop = 0
         for key, v in sorted(roll.items()):
@@ -180,7 +217,15 @@ class G1E2EWindows(Dataset):
                 continue
             ci = len(self.clips)
             # `key` is the per-pass id (unique, used for reporting); `base` is the caption/library id.
-            self.clips.append(dict(key=key, base=base, tok=tok, n=tok.shape[0]))
+            entry = dict(key=key, base=base, tok=tok, n=tok.shape[0])
+            if self.want_ref:
+                # The teacher's reference block, normalised with its own statistics, for use as the
+                # INTENT TARGET. Never an input: at inference there is no reference at any time, history
+                # included -- that is the task. Truncated to the token length so row indices line up.
+                r = v["ref_obs"].astype(np.float32)[::self.gen_stride][:tok.shape[0]]
+                assert r.shape[0] == tok.shape[0], (key, r.shape, tok.shape)
+                entry["ref"] = (r - self.ref_mean) / self.ref_std
+            self.clips.append(entry)
             # `s` runs to n - (H + F): the tail is reachable because _window_rows clamps. The IIP target
             # then repeats the clip's last state row, which is what the reference does past its end.
             for s in range(0, tok.shape[0] - (H + F) + 1, stride):
@@ -226,12 +271,13 @@ class G1E2EWindows(Dataset):
         x = self.mask_future_proprio(full[:self.H + self.F].copy())
         caps = self.emb[c["base"]]
         # Deterministic per-window choice, not a shared RNG: a generator built in __init__ is inherited
+        # (marker: ref fields are appended to the returned dict below when want_ref is set)
         # identically by every forked worker, so all of them drew the same caption sequence and the
         # paraphrase augmentation was a quarter as diverse as intended. Deriving the index from the
         # window also makes the eval split reproducible, which checkpoint selection depends on.
         j = 0 if self.deterministic_caption else (hash((c["base"], s)) % len(caps))
         progress = (s + self.H) / max(1, c["n"])
-        return dict(
+        out = dict(
             x=torch.from_numpy(x),
             fut=torch.from_numpy(fut.astype(np.float32)),
             holi=torch.from_numpy(self.holistic(ci, s)),
@@ -241,6 +287,26 @@ class G1E2EWindows(Dataset):
             scal=torch.tensor([progress, c["n"] / float(self.gen_hz) / 10.0], dtype=torch.float32),
             key=c["key"],
         )
+        if self.want_ref:
+            out["fut_ref"] = torch.from_numpy(self._ref_rows(c, s + self.H, self.H))
+            out["holi_ref"] = torch.from_numpy(self._ref_holistic(c, s))
+        return out
+
+    def _ref_rows(self, c, s, n):
+        """`n` rows of the clip's normalised reference block starting at `s`, tail clamped."""
+        idx = np.minimum(np.arange(s, s + n), c["n"] - 1)
+        return c["ref"][idx].astype(np.float32)
+
+    def _ref_holistic(self, c, s):
+        """The whole clip's reference block resampled to H rows, with the same span augmentation the
+        proprio holistic target uses -- so the two describe the same span."""
+        if self.holi_aug:
+            from hml_phys.intent_data import holistic_crop_rows
+            rng = np.random.RandomState((hash((c["base"], s)) ^ self.seed) & 0x7FFFFFFF)
+            rows = holistic_crop_rows(c["n"], self.H, rng, p_exact=self.p_holi_exact)
+        else:
+            rows = np.round(np.linspace(0, c["n"] - 1, self.H)).astype(np.int64)
+        return c["ref"][rows].astype(np.float32)
 
     def _rest_window(self, ci):
         """A window whose history is the clip's first frame held still, with the hold action.
@@ -264,7 +330,7 @@ class G1E2EWindows(Dataset):
         x = self.mask_future_proprio(full[:self.H + self.F].copy())
         caps = self.emb[c["base"]]
         j = 0 if self.deterministic_caption else (hash((c["base"], -1)) % len(caps))
-        return dict(
+        out = dict(
             x=torch.from_numpy(x.astype(np.float32)),
             fut=torch.from_numpy(fut.astype(np.float32)),
             holi=torch.from_numpy(self.holistic(ci, -1)),
@@ -274,6 +340,12 @@ class G1E2EWindows(Dataset):
             scal=torch.tensor([0.0, c["n"] / float(self.gen_hz) / 10.0], dtype=torch.float32),
             key=c["key"],
         )
+        if self.want_ref:
+            # A start-rest window's future is the clip's opening, so its reference rows start at H
+            # (the window is 16 held copies of frame 0, then the clip from frame 0).
+            out["fut_ref"] = torch.from_numpy(self._ref_rows(c, 0, self.H))
+            out["holi_ref"] = torch.from_numpy(self._ref_holistic(c, -1))
+        return out
 
     def holistic(self, ci, s=0):
         """The WHOLE clip's proprio, resampled to H rows -- MIND's holistic-intent target.
@@ -327,12 +399,14 @@ class G1E2EStateSeq(Dataset):
     down_t=2, stride_t=2) or the decoder cannot return the sequence it was given.
     """
 
-    def __init__(self, rollouts_path, L, gen_hz=25, stride=None, stats=None, max_clips=0, down=4):
+    def __init__(self, rollouts_path, L, gen_hz=25, stride=None, stats=None, max_clips=0, down=4,
+                 field="proprio", ref_stats_in=None):
         assert CONTROL_HZ % gen_hz == 0, (
             f"gen_hz must divide {CONTROL_HZ} by an integer stride; see G1E2EWindows for the list")
         assert L % down == 0, f"L={L} must be divisible by the VAE downsampling {down}"
+        assert field in ("proprio", "ref"), field
         self.gen_stride = CONTROL_HZ // gen_hz
-        self.L, self.gen_hz = L, gen_hz
+        self.L, self.gen_hz, self.field = L, gen_hz, field
         stride = stride or max(1, L // 2)
 
         roll = load_rollouts(rollouts_path)
@@ -348,7 +422,16 @@ class G1E2EStateSeq(Dataset):
         # numbers. Letting each stage recompute them only agrees when both see identical data, which is
         # a guarantee that quietly breaks the moment one run subsets its clips.
         self.mean_full, self.std_full = mean, std
-        self.mean, self.std = mean[:PROPRIO_DIM], std[:PROPRIO_DIM]
+        if field == "ref":
+            # The reference block has its own statistics -- it is a different quantity (target-minus-robot
+            # positions and reference velocities in the heading frame), not part of the 72-d token, so
+            # compute_stats never covered it. `ref_stats_in` lets the TEST split be given the TRAIN
+            # split's numbers; recomputing per split would leak the eval distribution in, which is the
+            # same discipline the token statistics follow.
+            self.mean, self.std = (ref_stats_in if ref_stats_in is not None
+                                   else ref_stats(roll, self.gen_stride))
+        else:
+            self.mean, self.std = mean[:PROPRIO_DIM], std[:PROPRIO_DIM]
 
         # Three KINDS of sequence, as the reference VAE trains on (train_intent_vae.py:73,126 uses
         # KINDS = ("hist", "fut", "holi")): contiguous slices AND the whole clip resampled to L rows.
@@ -357,7 +440,13 @@ class G1E2EStateSeq(Dataset):
         # HIP is trained to regress a latent the encoder was never fit to produce.
         self.clips, self.windows = [], []
         for key, v in sorted(roll.items()):
-            p = v["proprio"].astype(np.float32)[::self.gen_stride]
+            if self.field == "ref":
+                assert "ref_obs" in v, (
+                    f"clip {key} has no ref_obs: this rollout file predates the reference-block "
+                    f"recording. Re-record with the current g1e2e_record_rollouts.py.")
+                p = v["ref_obs"].astype(np.float32)[::self.gen_stride]
+            else:
+                p = v["proprio"].astype(np.float32)[::self.gen_stride]
             if p.shape[0] < L:
                 continue
             ci = len(self.clips)
