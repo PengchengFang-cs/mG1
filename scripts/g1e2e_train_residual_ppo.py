@@ -45,8 +45,9 @@ Maximising the teacher's own objective is also exactly the right target: beating
 means collecting more of the reward the teacher was trained to collect. `--w-track` / `--w-alive` keep
 the hand-rolled terms available as optional extras; both default to 0.
 
-TERMINATION. Contact, gravity, and reference distance at --ref-dist (0.5 m, the recorder's own value,
-which the teacher satisfies). `terminate_by_1time_motion` is left ON: the env then ends an episode when
+TERMINATION. Contact, gravity, and reference distance at --ref-dist, which defaults to the 1.5 m the
+teacher was trained with rather than the 0.5 m success criterion -- see the flag's own help for the
+measurement that settled it. `terminate_by_1time_motion` is left ON: the env then ends an episode when
 the clip runs out, marks it in `time_out_buf`, and restarts that env on its own clip at t=0. The first
 version of this script turned that OFF and emulated the clip end in Python without resetting the
 simulator -- `motion_lib_base.py:741` clamps the phase, so the reference froze on its last frame and the
@@ -144,9 +145,16 @@ def main():
                          "usable gradient. k=2 spans the measured 0.2-0.6 m range.")
     ap.add_argument("--rest-vel-thresh", type=float, default=0.1,
                     help="the reference counts as still when its mean body speed is below this (m/s)")
-    ap.add_argument("--ref-dist", type=float, default=0.5,
-                    help="terminate when the mean body distance to the reference exceeds this; the "
-                         "recorder's own value, which the teacher satisfies")
+    ap.add_argument("--ref-dist", type=float, default=1.5,
+                    help="terminate when the MEAN body distance to the reference exceeds this. 1.5 m "
+                         "is config_eval.yaml's own value and what the teacher was TRAINED with. "
+                         "0.5 m -- the recorder's value, and OmniH2O's success CRITERION rather than "
+                         "its training threshold -- was measured here to end 89%% of episodes after "
+                         "only 80 of a 365-step clip (6.2 resets/step against the 1.40 whole clips "
+                         "would give). Our policy is conditioned on text and has no reference, so a "
+                         "0.5 m leash truncates most of every clip, spends the -250 on losing the "
+                         "reference rather than on falling -- which is the only thing we measure "
+                         "(CLAUDE.md §13) -- and never lets the residual see the back half of a clip.")
     ap.add_argument("--num-steps", type=int, default=10, help="flow sampling steps for the base policy")
     ap.add_argument("--cfg-action", type=float, default=1.0,
                     help="the base policy's action guidance. 1.0 is plain conditional and the only "

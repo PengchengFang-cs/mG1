@@ -26,7 +26,7 @@ python -u scripts/g1e2e_train_residual_ppo.py \
   --refs data/g1_e2e/refs_train_part1.pkl \
   --text-cache data/g1_e2e/text_clipL14_full \
   --out "$OUT" --num-envs 512 --iters "$ITERS" --max-hours "$HOURS" \
-  --residual-scale "$RSCALE" --save-every 25 --device cuda:0 "$@"
+  --residual-scale "$RSCALE" --ref-dist 1.5 --save-every 25 --device cuda:0 "$@"
 TRAIN=$?
 echo "### $TAG TRAIN_EXIT=$TRAIN $(date -Is)"
 [ $TRAIN -ne 0 ] && { echo "### $TAG training failed, skipping the evaluation"; exit $TRAIN; }
