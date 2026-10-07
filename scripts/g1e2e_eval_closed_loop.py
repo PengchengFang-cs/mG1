@@ -81,6 +81,11 @@ def main():
     ap.add_argument("--holi-per-plan", action="store_true",
                     help="attribution knob: re-draw the holistic intent inside every plan, as the "
                          "pre-fix loop did, instead of once per episode (mc_rollout.py:160-169).")
+    ap.add_argument("--residual", default=None,
+                    help="a residual-PPO checkpoint (outputs/.../latest.pt) to apply on top of the "
+                         "base policy. The residual acts EVERY control step, so it corrects at 50 Hz "
+                         "what the base policy plans at 25 Hz. Evaluation applies its mean, not a "
+                         "sample: no exploration noise.")
     ap.add_argument("--weights", choices=["model", "raw"], default="model",
                     help="which weight set in the checkpoint to roll out. 'model' is the EMA (what the "
                          "reference rolls out, mc_rollout.py:25,31); 'raw' is the AdamW iterate at the "
@@ -337,6 +342,27 @@ def main():
                   if args.hold_action == "hold" else torch.zeros_like(env.dof_pos))
         hist[:, :, :PROPRIO_DIM] = ((prop0 - mean[:PROPRIO_DIM]) / std[:PROPRIO_DIM])[:, None, :]
         hist[:, :, PROPRIO_DIM:] = ((hold_a - mean[PROPRIO_DIM:]) / std[PROPRIO_DIM:])[:, None, :]
+    res = None
+    if args.residual:
+        assert not args.teacher, "--residual corrects OUR policy; it has no meaning for the teacher"
+        from hml_phys.g1e2e_residual import load_residual
+        res, rck = load_residual(args.residual, dev, ACTION_DIM)
+        assert rck["res_in"] == PROPRIO_DIM + ACTION_DIM + 27 + 2, \
+            f"residual input width {rck['res_in']} is not this observation layout"
+        assert Path(rck["base_policy"]).name == policy_path.name, (
+            f"the residual was trained on {rck['base_policy']}, not {policy_path} -- a residual is "
+            f"only valid on top of the base policy it was trained against")
+        print(f"residual: iteration {rck['iter']}, scale {res.scale} raw action units, "
+              f"trained on {rck['base_policy']}", flush=True)
+
+    def res_input(prop, a_base, obs_now):
+        """Exactly the training script's input, in the same order."""
+        return torch.cat([(prop - mean[:PROPRIO_DIM]) / std[:PROPRIO_DIM],
+                          (a_base - mean[PROPRIO_DIM:]) / std[PROPRIO_DIM:],
+                          obs_now[:, 48:75],
+                          (float(step) / n_env.float()).clamp(max=1.0)[:, None],
+                          (dur_s / 10.0)[:, None]], dim=-1)
+
     t0 = time.time()
     step = 0
 
@@ -486,6 +512,12 @@ def main():
                              n_fell=int((~alive).sum())))
             print(f"\nnoise {sigma:.3f}   fall rate {fall_rate:.4f}   "
                   f"duration completion {duration:.4f}   {time.time() - ts:.0f}s", flush=True)
+        # Save the per-clip outcome too, not just the aggregate. Without it the teacher's FAILING CLIPS
+        # are unknown, and "do our failures and the teacher's land on the same clips?" cannot be asked --
+        # which is the question that decides whether further policy optimisation can help at all: on a
+        # clip the teacher also fails, it has no correction to offer.
+        np.savez(out.with_suffix(".bodypos.npz"),
+                 fall_step=fall_step.cpu().numpy(), horizon=n_env.cpu().numpy(), keys=np.array(keys))
         out.write_text(json.dumps(dict(mode="teacher", hold=hold, effective_hz=CONTROL_HZ / hold,
                                        refs=str(refs), n_envs=B, episode=args.episode,
                                        clip_s_mean=float(dur_s.mean()), rows=rows),
@@ -574,10 +606,19 @@ def main():
                 break
             a = actions[:, k]
             prop_in = read_prop()           # the state this action is applied in -- the recorder's pairing
+            a_hist = None
             for _ in range(hold):
                 if step >= n_ctrl:
                     break
-                _, _, _, dones, _ = env.step(a)
+                a_now = a
+                if res is not None:
+                    # One correction per CONTROL step, from the live state: that 50 Hz feedback is the
+                    # whole point of the residual. The base plan `a` is held across the hold as before.
+                    with torch.inference_mode():
+                        a_now = a + res.act_mean(res_input(read_prop(), a, obs))
+                if a_hist is None:
+                    a_hist = a_now.detach().clone()     # what was actually applied in `prop_in`
+                obs, _, _, dones, _ = env.step(a_now)
                 # Only a fall WITHIN the clip counts. Short-clip envs keep stepping to the batch horizon
                 # because isaacgym steps them together; what they do after their own motion has ended is
                 # not part of what the caption asked for.
@@ -588,7 +629,7 @@ def main():
                 # 13-wide state tensor is _rigid_body_state and is not reshaped per env.
                 body_pos.append(env._rigid_body_pos.detach().clone().cpu())
                 step += 1
-            push_hist(prop_in, actions[:, k])
+            push_hist(prop_in, actions[:, k] if a_hist is None else a_hist)
 
     fall_rate = float((~alive).float().mean())
     duration = float((fall_step.float() / n_env.float()).mean())
@@ -598,7 +639,9 @@ def main():
     bp = torch.stack(body_pos, 1).numpy()      # [B, T, n_bodies, 3]
     np.savez(out.with_suffix(".bodypos.npz"), body_pos=bp.astype(np.float16),
              fall_step=fall_step.cpu().numpy(), horizon=n_env.cpu().numpy(), keys=np.array(keys))
-    res = dict(policy=str(policy_path), refs=str(refs), warmup_tracker=bool(args.warmup_tracker),
+    result = dict(policy=str(policy_path), refs=str(refs), warmup_tracker=bool(args.warmup_tracker),
+               residual=(str(args.residual) if args.residual else None),
+               residual_iter=(int(rck["iter"]) if res is not None else None),
                n_envs=B, episode=args.episode, episode_s=(args.episode_s if args.episode == "fixed" else None),
                clip_s_mean=float(dur_s.mean()), hist_init=args.hist_init, weights=args.weights, ckpt_step=ck.get("step"),
                hold_action=args.hold_action, holi_per_plan=bool(args.holi_per_plan),
@@ -610,7 +653,7 @@ def main():
                note=("Single rollout, single computation (CLAUDE.md §4). Physical metrics only; the "
                      "semantic metrics are computed separately from the saved body positions through "
                      "hml_phys/g1_to_smpl.py -> the Guo evaluator."))
-    out.write_text(json.dumps(res, indent=2))
+    out.write_text(json.dumps(result, indent=2))
     print(f"wrote {out} and {out.with_suffix('.bodypos.npz').name}")
 
 
