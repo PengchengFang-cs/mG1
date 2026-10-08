@@ -107,6 +107,13 @@ def main():
                     help="a npz holding body_pos_gt; adds rung 2 (the reference through the same mapper)")
     ap.add_argument("--split", default="train", help="the GT split the captions come from")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--match-keys", action="store_true",
+                    help="restrict the GT set to exactly the clips that were rolled out. WITHOUT this, "
+                         "rung 1 is all ~24.5k train motions while rungs 2-4 are the ~490 clips of the "
+                         "prompt pool, so rung 1 is NOT a matched control and the rung1->rung2 drop "
+                         "cannot be attributed. Rungs 2,3,4 are matched to each other either way, "
+                         "because they are the same clips through the same mapper and differ only in "
+                         "what produced the motion.")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
@@ -141,6 +148,14 @@ def main():
         print(f"{label}: {key} {bp.shape}; {m.describe()}", flush=True)
         rungs.append((label, to_items(bp, d["fall_step"].astype(int), d["horizon"].astype(int),
                                       [str(k) for k in d["keys"]], cap2tok, m, label)))
+
+    if args.match_keys:
+        used = {it["key"] for _, items in rungs for it in items}
+        before = len(gt_items)
+        gt_items = [it for it in gt_items if it["key"] in used]
+        print(f"\n--match-keys: GT restricted {before} -> {len(gt_items)} items, the same clips the "
+              f"rollouts cover. Rung 1 is now a matched control.", flush=True)
+        assert len(gt_items) >= 32, f"only {len(gt_items)} GT items left; R-precision needs 32"
 
     ev = HMLEvaluator(args.device)
     out = {}
