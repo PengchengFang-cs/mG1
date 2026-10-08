@@ -5,9 +5,12 @@
 # node, and all output goes to a file on shared storage from inside the step, so losing tmux or the
 # login node cannot stop or hang the run (slurm-allocation skill, "Why a properly rooted run survives").
 #
-#   usage: g1e2e_ppo_launch.sh <tag> <gpu> <residual_scale> <max_hours> <iters> [extra args...]
+#   usage: g1e2e_ppo_launch.sh <tag> <gpu> <residual_scale> <max_hours> <iters> <ref_dist> [extra...]
+#
+# ref_dist 0 switches the reference-distance termination off, so training ends on exactly what
+# evaluation ends on. Pass --resume in <extra...> to continue from <out>/latest.pt.
 set -uo pipefail
-TAG=$1; GPU=$2; RSCALE=$3; HOURS=$4; ITERS=$5; shift 5
+TAG=$1; GPU=$2; RSCALE=$3; HOURS=$4; ITERS=$5; REFD=$6; shift 6
 REPO=/iridisfs/scratch/pf2m24/projects/motion_rebot
 OUT=$REPO/outputs/g1e2e/ppo_$TAG
 LOG=$REPO/logs/g1e2e_ppo_$TAG.log
@@ -20,20 +23,20 @@ source $REPO/scripts/activate_h2h.sh
 cd $REPO
 export CUDA_VISIBLE_DEVICES=$GPU
 
-echo "### $TAG start $(date -Is) on $(hostname) gpu $GPU, residual-scale $RSCALE, max $HOURS h / $ITERS iters"
+echo "### $TAG start $(date -Is) on $(hostname) gpu $GPU: scale $RSCALE, ref-dist $REFD, $ITERS iters, max $HOURS h, extra: $*"
 python -u scripts/g1e2e_train_residual_ppo.py \
   --policy outputs/g1e2e/push_G_lr25e6/best.pt \
   --refs data/g1_e2e/refs_train_part1.pkl \
   --text-cache data/g1_e2e/text_clipL14_full \
   --out "$OUT" --num-envs 512 --iters "$ITERS" --max-hours "$HOURS" \
-  --residual-scale "$RSCALE" --ref-dist 1.5 --save-every 25 --device cuda:0 "$@"
+  --residual-scale "$RSCALE" --ref-dist "$REFD" --save-every 25 --device cuda:0 "$@"
 TRAIN=$?
 echo "### $TAG TRAIN_EXIT=$TRAIN $(date -Is)"
 [ $TRAIN -ne 0 ] && { echo "### $TAG training failed, skipping the evaluation"; exit $TRAIN; }
 
 # Exactly ONE closed-loop rollout of the final residual, on the training prompt pool, per-clip
 # episodes, K=1, cfg_action 1.0 -- the same protocol every number in STATUS.md §5.7 was measured
-# under, so it is directly comparable to 0.0645 / 0.9576 and to the teacher's 0.0586 / 0.9604.
+# under, so it is directly comparable to 0.0547 / 0.9629 and to the teacher's 0.0586 / 0.9594.
 # One rollout, one computation (CLAUDE.md §4).
 echo "### $TAG eval start $(date -Is)"
 python -u scripts/g1e2e_eval_closed_loop.py \

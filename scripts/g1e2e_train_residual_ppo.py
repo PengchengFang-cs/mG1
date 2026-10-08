@@ -154,7 +154,15 @@ def main():
                          "would give). Our policy is conditioned on text and has no reference, so a "
                          "0.5 m leash truncates most of every clip, spends the -250 on losing the "
                          "reference rather than on falling -- which is the only thing we measure "
-                         "(CLAUDE.md §13) -- and never lets the residual see the back half of a clip.")
+                         "(CLAUDE.md §13) -- and never lets the residual see the back half of a clip. "
+                         "0 switches the leash OFF entirely, which makes training terminate on exactly "
+                         "what evaluation terminates on, so the logged fall fraction becomes "
+                         "comparable to the reported fall rate and the residual sees whole clips. That "
+                         "is safe HERE because the leash's job is to stop a policy trading the task "
+                         "for survival, and a residual bounded at 0.32 of one action std on top of a "
+                         "FROZEN policy that already does the task cannot stand still even if it "
+                         "wanted to -- and the teacher's reward pays nothing for standing still, since "
+                         "there is no alive bonus.")
     ap.add_argument("--num-steps", type=int, default=10, help="flow sampling steps for the base policy")
     ap.add_argument("--cfg-action", type=float, default=1.0,
                     help="the base policy's action guidance. 1.0 is plain conditional and the only "
@@ -225,8 +233,8 @@ def main():
         cfg_h = hydra.compose(config_name="config_eval", overrides=[
             f"motion.motion_file={refs}", f"num_envs={args.num_envs}", f"sim_device={args.device}",
             "headless=True", "use_wandb=False",
-            "asset.terminate_by_ref_motion_distance=True",
-            f"asset.termination_scales.max_ref_motion_distance={args.ref_dist}",
+            f"asset.terminate_by_ref_motion_distance={args.ref_dist > 0}",
+            f"asset.termination_scales.max_ref_motion_distance={max(args.ref_dist, 0.01)}",
             "asset.terminate_by_1time_motion=True",
             "motion.resample_motions_for_envs=False",
             "rewards.penalty_curriculum=False",
@@ -234,7 +242,7 @@ def main():
             *overrides])
     cfg = EasyDict(OmegaConf.to_container(cfg_h, resolve=True))
     cfg.physics_engine = gymapi.SIM_PHYSX
-    assert cfg.asset.terminate_by_ref_motion_distance is True
+    assert cfg.asset.terminate_by_ref_motion_distance is (args.ref_dist > 0)
     assert cfg.asset.terminate_by_1time_motion is True, \
         "the env must end a clip itself; see the docstring on the frozen-reference corruption"
     assert cfg.motion.resample_motions_for_envs is False
@@ -247,8 +255,10 @@ def main():
         f"{48 + REF_DIM + ACTION_DIM + n_hist_block}. Re-derive it from legged_robot.py.")
     assert cfg.motion.teleop_obs_version == "v-teleop-extend-vr-max-nolinvel", \
         cfg.motion.teleop_obs_version
+    leash = f"{args.ref_dist} m ON" if args.ref_dist > 0 else ("OFF -- the only early end is a real "
+                                                              "fall, exactly as in evaluation")
     print(f"termination: contacts {cfg.asset.terminate_after_contacts_on}, "
-          f"gravity {cfg.asset.terminate_by_gravity}, reference distance {args.ref_dist} m ON, "
+          f"gravity {cfg.asset.terminate_by_gravity}, reference distance {leash}, "
           f"clip end ON (flagged as time-out, no -250)", flush=True)
 
     env, _ = task_registry.make_env_hydra(name=cfg.task, hydra_cfg=cfg, env_cfg=cfg)
