@@ -168,6 +168,12 @@ def main():
     assert policy_path.exists(), policy_path
     assert refs.exists(), refs
     assert text_cache.is_dir(), text_cache
+    # Resolved HERE, before the os.chdir to the legged_gym root below: after that chdir any relative
+    # path from the command line resolves against the wrong directory. --residual was missing from this
+    # list, so a relative --residual failed with FileNotFoundError while an absolute one worked.
+    if args.residual:
+        args.residual = str(Path(args.residual).resolve())
+        assert Path(args.residual).exists(), args.residual
 
     assert (LEGGED_GYM / "resources/robots/g1/urdf/g1_21dof.urdf").exists(), "21-DoF asset missing"
     os.chdir(LEGGED_GYM)
@@ -310,7 +316,7 @@ def main():
     # removes two approximations from hml_phys/g1_to_smpl.py, which has to guess the hands and head from
     # positions alone, and it hands us the reference's own joint trajectory for free: that is the rung of
     # the semantic ladder that measures what the G1 shape and the mapper cost, independent of any policy.
-    body_ext, body_gt = [], []
+    body_ext, body_gt, prop = [], [], []
 
     # Everything is stored RELATIVE TO EACH ENV'S OWN ORIGIN, and as float32.
     #
@@ -330,6 +336,12 @@ def main():
     org_np = org.cpu().numpy().astype(np.float32)[:, None, :]       # [B,1,3]
 
     def capture():
+        # The robot's own 51-d state, which is what the text<->G1-motion retrieval model
+        # (hml_phys/g1_tmr.py) scores. It needs no mapping of any kind, and it is exactly the field's
+        # approach: five of eleven surveyed text-to-humanoid papers train a retrieval model on robot
+        # trajectories rather than projecting them onto SMPL joints, because a human-motion evaluator
+        # saturates near chance on robot motion (STATUS.md §5.11c-d).
+        prop.append(read_prop().detach().clone().cpu())
         body_pos.append((env._rigid_body_pos.detach() - org[:, None, :]).clone().cpu())
         e = getattr(env, "extras", {})
         if "body_pos" in e:
@@ -553,6 +565,7 @@ def main():
         # clip the teacher also fails, it has no correction to offer.
         np.savez(out.with_suffix(".bodypos.npz"),
                  **({} if not body_pos else dict(body_pos=torch.stack(body_pos, 1).numpy().astype(np.float32))),
+             **({} if not prop else dict(proprio=torch.stack(prop, 1).numpy().astype(np.float32))),
                  **({} if not body_ext else dict(body_pos_ext=np.stack(body_ext, 1).astype(np.float32))),
                  **({} if not body_gt else dict(body_pos_gt=np.stack(body_gt, 1).astype(np.float32))),
                  fall_step=fall_step.cpu().numpy(), horizon=n_env.cpu().numpy(), keys=np.array(keys))
@@ -676,6 +689,7 @@ def main():
 
     np.savez(out.with_suffix(".bodypos.npz"),
              **({} if not body_pos else dict(body_pos=torch.stack(body_pos, 1).numpy().astype(np.float32))),
+             **({} if not prop else dict(proprio=torch.stack(prop, 1).numpy().astype(np.float32))),
              **({} if not body_ext else dict(body_pos_ext=np.stack(body_ext, 1).astype(np.float32))),
              **({} if not body_gt else dict(body_pos_gt=np.stack(body_gt, 1).astype(np.float32))),
              fall_step=fall_step.cpu().numpy(), horizon=n_env.cpu().numpy(), keys=np.array(keys))
