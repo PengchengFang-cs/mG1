@@ -114,11 +114,16 @@ def penetration_mm_raw(pos_list, tol=TOL):
     return float(np.mean(np.concatenate(v)))
 
 
-def skating_mm_raw(pos_list, contact_h=0.05):
-    """PhysDiff/CLoSD skating on raw sim: horizontal displacement of foot bodies that stay in contact."""
+def skating_mm_raw(pos_list, contact_h=0.05, feet=None):
+    """PhysDiff/CLoSD skating on raw sim: horizontal displacement of foot bodies that stay in contact.
+
+    `feet` are body indices; the default is the SMPL character's MuJoCo order. Any other robot must
+    pass its own -- G1's 21-DoF body list has no toes, and its ankle bodies are at 6 and 12.
+    """
+    feet = SIM_FEET + SIM_ANKLES if feet is None else list(feet)
     vals = []
     for p in pos_list:
-        f = p[:, SIM_FEET + SIM_ANKLES]
+        f = p[:, feet]
         h = f[:, :, 2]
         contact = (h[:-1] < contact_h) & (h[1:] < contact_h)
         disp = np.linalg.norm(f[1:, :, :2] - f[:-1, :, :2], axis=-1) * 1000.0
@@ -142,6 +147,7 @@ def duration_frame_weighted(valid_frames, ref_frames):
     return float(np.sum(valid_frames) / max(1.0, np.sum(ref_frames)))
 
 
-def all_metrics_raw(pos_list):
+def all_metrics_raw(pos_list, feet=None, fps=SIM_FPS):
     return dict(floating_mm=floating_mm_raw(pos_list), penetration_mm=penetration_mm_raw(pos_list),
-                skating_mm=skating_mm_raw(pos_list), jerk_mm_frame3=jerk_mm_frame3_raw(pos_list), fps=SIM_FPS)
+                skating_mm=skating_mm_raw(pos_list, feet=feet),
+                jerk_mm_frame3=jerk_mm_frame3_raw(pos_list), fps=fps)

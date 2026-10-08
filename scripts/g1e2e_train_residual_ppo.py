@@ -117,6 +117,15 @@ def main():
                          "replacement. The closed-loop noise sweep (STATUS.md §5.6) puts relative "
                          "sigma <= 0.20 inside the resolution floor and sigma 0.45 clearly harmful, "
                          "so 0.3 raw is a saturation BOUND the residual should rarely reach.")
+    ap.add_argument("--residual-mask", default="all",
+                    help="which joints the residual may move: all | legs | hipknee | legs_all. "
+                         "RobotDancing (arXiv 2509.20717) Table III is the reason this exists: a "
+                         "residual on every DoF cut global position error 4.5%% against an "
+                         "absolute-action baseline, while one restricted to bilateral hip/knee pitch "
+                         "cut it 15.7%% -- over three times as much. Our own 19 addressable failures "
+                         "have reference vertical-velocity peaks 1.8x the succeeding group's "
+                         "(STATUS.md §5.8), which points at the legs independently. The Gaussian is "
+                         "restricted too, not masked after the fact.")
     ap.add_argument("--init-log-std", type=float, default=-2.0)
     ap.add_argument("--min-log-std", type=float, default=-4.0,
                     help="floor on log_std, so the ratio cannot blow up once the policy sharpens")
@@ -210,7 +219,8 @@ def main():
     from hml_phys.intent_vae import IntentVAE                             # noqa: E402
     from hml_phys.intent_flow import (intent_hidden, sample_actions,      # noqa: E402
                                       sample_latent)
-    from hml_phys.g1e2e_residual import Residual                          # noqa: E402
+    from hml_phys.g1e2e_residual import (DOF_NAMES, Residual,             # noqa: E402
+                                         mask_indices)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -397,8 +407,14 @@ def main():
     # and the residual could only ever learn a reference-agnostic stabiliser.
     RES_IN = PROPRIO_DIM + ACTION_DIM + REF_DIM + 2
 
+    active = mask_indices(args.residual_mask)
+    if hasattr(env, "dof_names"):
+        assert list(env.dof_names) == DOF_NAMES, (
+            f"the env's DoF order is not the one the joint masks are written against:\n"
+            f"  env: {list(env.dof_names)}\n  expected: {DOF_NAMES}")
     res = Residual(RES_IN, ACTION_DIM, args.residual_scale, args.init_log_std,
-                   args.min_log_std).to(dev)
+                   args.min_log_std, active=active).to(dev)
+    N_OUT = ACTION_DIM if active is None else len(active)
     opt = torch.optim.Adam(res.parameters(), lr=args.lr)
     it0 = 0
     if args.resume and (out / "latest.pt").exists():
@@ -409,9 +425,12 @@ def main():
         it0 = int(rck.get("iter", 0))
         print(f"resumed from {out / 'latest.pt'} at iteration {it0}", flush=True)
     n_res = sum(p.numel() for p in res.parameters())
+    moves = "all 21 joints" if active is None else \
+        f"{len(active)} joints: {', '.join(DOF_NAMES[i] for i in active)}"
     print(f"residual: {n_res / 1e6:.2f} M params, input {RES_IN} "
           f"(proprio {PROPRIO_DIM} + base action {ACTION_DIM} + reference {REF_DIM} + 2), "
-          f"scale {args.residual_scale} raw action units, initialised to a no-op", flush=True)
+          f"scale {args.residual_scale} raw action units, initialised to a no-op; "
+          f"moves {moves}", flush=True)
 
     def res_input(prop, a_base, obs_now):
         return torch.cat([(prop - mean[:PROPRIO_DIM]) / std[:PROPRIO_DIM],
@@ -450,7 +469,7 @@ def main():
 
     for it in range(it0 + 1, args.iters + 1):
         bx = torch.zeros(T, B, RES_IN, device=dev)
-        bu = torch.zeros(T, B, ACTION_DIM, device=dev)
+        bu = torch.zeros(T, B, N_OUT, device=dev)
         blp = torch.zeros(T, B, device=dev)
         bv = torch.zeros(T, B, device=dev)
         br = torch.zeros(T, B, device=dev)
@@ -537,7 +556,7 @@ def main():
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
         fx = bx.reshape(-1, RES_IN)
-        fu = bu.reshape(-1, ACTION_DIM)
+        fu = bu.reshape(-1, N_OUT)
         flp = blp.reshape(-1)
         fadv = adv.reshape(-1)
         fret = ret.reshape(-1)
@@ -597,7 +616,8 @@ def main():
         timed_out = args.max_hours and (time.time() - t0) / 3600 >= args.max_hours
         if it % args.save_every == 0 or it == args.iters or timed_out:
             torch.save(dict(model=res.state_dict(), opt=opt.state_dict(), args=vars(args), iter=it,
-                            base_policy=str(policy_path), res_in=RES_IN), out / "latest.pt")
+                            base_policy=str(policy_path), res_in=RES_IN, active=active),
+                       out / "latest.pt")
         if timed_out:
             print(f"stopping at iteration {it}: --max-hours {args.max_hours} reached", flush=True)
             break
