@@ -303,6 +303,39 @@ def main():
 
     hist = torch.zeros(B, H, TOKEN_DIM, device=dev)
     body_pos = []
+    # The env already computes both of these every control step under `im_eval` (legged_robot.py:493-522)
+    # and the first version of this script threw them away. `body_pos` there is the robot's 22 links PLUS
+    # the three extend bodies -- the two hand sites (elbow + 0.2 m, rotated by the elbow's own frame) and
+    # the head (pelvis + 0.45 m) -- and `body_pos_gt` is the REFERENCE in the same layout. Keeping them
+    # removes two approximations from hml_phys/g1_to_smpl.py, which has to guess the hands and head from
+    # positions alone, and it hands us the reference's own joint trajectory for free: that is the rung of
+    # the semantic ladder that measures what the G1 shape and the mapper cost, independent of any policy.
+    body_ext, body_gt = [], []
+
+    # Everything is stored RELATIVE TO EACH ENV'S OWN ORIGIN, and as float32.
+    #
+    # Storing world coordinates as float16 was a real defect, found 2026-10-08: isaacgym lays 512 envs
+    # out on a grid, so |xy| reaches 156 m, and float16's spacing there is 125 mm against joint-to-joint
+    # distances of 100-400 mm. It destroyed the geometry, and destroyed it WORSE the further an env sat
+    # from the origin -- HumanML3D's `process_file` returned non-finite features for 21/64 of the
+    # nearest envs and 58/64 of the furthest, 392/512 overall. Anything built from horizontal position
+    # (foot sliding, root speed, jerk) was corrupted the same way. Only z (max 2.1 m, so ~1 mm spacing)
+    # and the integer fall_step/horizon survived it.
+    #
+    # Subtracting the origin brings magnitudes to a few metres, where float32 holds sub-micron precision.
+    # The env builds its reference block with `env_origins + env_origins_init_3Doffset`
+    # (legged_robot.py:494), so the same offset comes off robot and reference to keep them in one frame.
+    # HumanML3D's representation is root-relative anyway, so dropping the origin loses nothing.
+    org = (env.env_origins + env.env_origins_init_3Doffset).detach().clone()
+    org_np = org.cpu().numpy().astype(np.float32)[:, None, :]       # [B,1,3]
+
+    def capture():
+        body_pos.append((env._rigid_body_pos.detach() - org[:, None, :]).clone().cpu())
+        e = getattr(env, "extras", {})
+        if "body_pos" in e:
+            body_ext.append(np.asarray(e["body_pos"], dtype=np.float32) - org_np)
+        if "body_pos_gt" in e:
+            body_gt.append(np.asarray(e["body_pos_gt"], dtype=np.float32) - org_np)
     alive = torch.ones(B, dtype=torch.bool, device=dev)
     # "Never fell" is encoded as reaching the env's OWN horizon, not the batch's.
     fall_step = n_env.clone()
@@ -381,7 +414,7 @@ def main():
             newly = dones.bool() & alive & (step < n_env)
             fall_step[newly] = step
             alive &= ~newly
-            body_pos.append(env._rigid_body_pos.detach().clone().cpu())
+            capture()
             step += 1
             if w % hold == hold - 1:
                 push_hist(prop_in, a_in)
@@ -505,6 +538,8 @@ def main():
                     newly = dones.bool() & alive & (step < n_env)
                     fall_step[newly] = step
                     alive &= ~newly
+                    if len(sigmas) == 1 or sigma == 0.0:
+                        capture()            # only the clean pass; a noise sweep would overwrite it
                     step += 1
             fall_rate = float((~alive).float().mean())
             duration = float((fall_step.float() / n_env.float()).mean())
@@ -517,6 +552,9 @@ def main():
         # which is the question that decides whether further policy optimisation can help at all: on a
         # clip the teacher also fails, it has no correction to offer.
         np.savez(out.with_suffix(".bodypos.npz"),
+                 **({} if not body_pos else dict(body_pos=torch.stack(body_pos, 1).numpy().astype(np.float32))),
+                 **({} if not body_ext else dict(body_pos_ext=np.stack(body_ext, 1).astype(np.float32))),
+                 **({} if not body_gt else dict(body_pos_gt=np.stack(body_gt, 1).astype(np.float32))),
                  fall_step=fall_step.cpu().numpy(), horizon=n_env.cpu().numpy(), keys=np.array(keys))
         out.write_text(json.dumps(dict(mode="teacher", hold=hold, effective_hz=CONTROL_HZ / hold,
                                        refs=str(refs), n_envs=B, episode=args.episode,
@@ -627,7 +665,7 @@ def main():
                 alive &= ~newly
                 # legged_robot.py:2352 keeps this already shaped [num_envs, num_bodies, 3]; the raw
                 # 13-wide state tensor is _rigid_body_state and is not reshaped per env.
-                body_pos.append(env._rigid_body_pos.detach().clone().cpu())
+                capture()
                 step += 1
             push_hist(prop_in, actions[:, k] if a_hist is None else a_hist)
 
@@ -636,8 +674,10 @@ def main():
     print(f"\nfall rate {fall_rate:.4f}   duration completion {duration:.4f}   "
           f"{time.time() - t0:.0f}s for {n_ctrl} control steps")
 
-    bp = torch.stack(body_pos, 1).numpy()      # [B, T, n_bodies, 3]
-    np.savez(out.with_suffix(".bodypos.npz"), body_pos=bp.astype(np.float16),
+    np.savez(out.with_suffix(".bodypos.npz"),
+             **({} if not body_pos else dict(body_pos=torch.stack(body_pos, 1).numpy().astype(np.float32))),
+             **({} if not body_ext else dict(body_pos_ext=np.stack(body_ext, 1).astype(np.float32))),
+             **({} if not body_gt else dict(body_pos_gt=np.stack(body_gt, 1).astype(np.float32))),
              fall_step=fall_step.cpu().numpy(), horizon=n_env.cpu().numpy(), keys=np.array(keys))
     result = dict(policy=str(policy_path), refs=str(refs), warmup_tracker=bool(args.warmup_tracker),
                residual=(str(args.residual) if args.residual else None),
