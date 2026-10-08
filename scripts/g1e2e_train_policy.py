@@ -65,6 +65,15 @@ def main():
     ap.add_argument("--heads", type=int, default=12)
     ap.add_argument("--depth-double", type=int, default=3)
     ap.add_argument("--depth-single", type=int, default=6)
+    ap.add_argument("--ablate-intent", default="none", choices=["none", "all", "hip", "iip"],
+                    help="TRAIN an ablation of the MIND intent mechanism, to find out whether it earns "
+                         "its place. 'all': the action policy never sees intent tokens, so it is "
+                         "conditioned on text and proprio alone, and the HIP/IIP losses are dropped "
+                         "since nothing consumes them. 'hip': the policy sees the holistic half only. "
+                         "'iip': the policy sees the immediate half only -- note this does NOT remove "
+                         "HIP from the architecture, because IIP takes HIP's hidden states as its "
+                         "memory (mem_extra=hH), so 'iip' means 'the policy reads only the immediate "
+                         "tokens', not 'HIP is gone'. Removing HIP outright is a deeper change.")
     ap.add_argument("--intent-dim", type=int, default=384)
     ap.add_argument("--intent-heads", type=int, default=6)
     ap.add_argument("--intent-depth", type=int, default=4)
@@ -423,12 +432,35 @@ def main():
                            mem=mem, mem_valid=mem_valid, prefix_latent=lat_hist, scalars=scal,
                            mem_extra=hH)
         toks, tval = model.intent_tokens(hH, hI, keep)
+        tval = mask_intent(tval)
         t = fl.sample_t(B, dev, generator=gen)
         z, _ = build_state_elem(x_in, gmask, t, generator=gen)
         x0_hat = model.policy(z, obs, t, txt, pooled, tlen, scal,
                               extra_tokens=toks, extra_valid=tval)
         l_act = policy_loss(*velocity_pair(x0_hat, x_in, z, t), gmask)
         return l_hip, l_iip, l_act
+
+    def mask_intent(tval):
+        """Hide part of the intent stream from the action policy. The 8 tokens are 4 holistic then 4
+        immediate (intent_model.py:131), so the split is down the middle."""
+        if args.ablate_intent == "none":
+            return tval
+        half = tval.shape[1] // 2
+        m = torch.zeros_like(tval)
+        if args.ablate_intent == "hip":
+            m[:, :half] = tval[:, :half]
+        elif args.ablate_intent == "iip":
+            m[:, half:] = tval[:, half:]
+        return m
+
+    def total_loss(l_hip, l_iip, l_act):
+        """MIND eq. 5, equal weights -- minus any predictor the ablation has disconnected, whose loss
+        would otherwise train a module nothing reads."""
+        if args.ablate_intent == "all":
+            return l_act
+        if args.ablate_intent == "hip":
+            return l_hip + l_act          # IIP disconnected from the policy
+        return l_hip + l_iip + l_act      # 'iip' keeps both: IIP needs HIP as its memory
 
     def loader(ds, shuffle):
         return DataLoader(ds, batch_size=args.batch, shuffle=shuffle, num_workers=4,
@@ -468,6 +500,7 @@ def main():
         hI_c = intent_hidden(model.iip, I_I, s_t, gen, mem=mem_c, mem_valid=mv_c,
                              prefix_latent=lat_hist, scalars=scal, mem_extra=hH_c)
         toks, tval = model.intent_tokens(hH_c, hI_c, torch.ones(B, dtype=torch.bool, device=dev))
+        tval = mask_intent(tval)
         t = fl.sample_t(B, dev, generator=gen)
         z, _ = build_state_elem(x_in, gmask, t, generator=gen)
         x0_hat = model.policy(z, obs, t, text, text_pooled, text_len, scal,
@@ -509,7 +542,7 @@ def main():
                 break
             x, fut, holi, text, pooled, tlen, scal, fut_ref, holi_ref = batch_to_dev(b)
             l_hip, l_iip, l_act = losses(x, fut, holi, text, pooled, tlen, scal, fut_ref, holi_ref)
-            loss = l_hip + l_iip + l_act                      # MIND eq. 5, equal weights
+            loss = total_loss(l_hip, l_iip, l_act)
             if not torch.isfinite(loss):
                 raise SystemExit(
                     f"non-finite loss at step {step}: hip {float(l_hip)} iip {float(l_iip)} "

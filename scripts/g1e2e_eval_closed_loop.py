@@ -81,6 +81,15 @@ def main():
     ap.add_argument("--holi-per-plan", action="store_true",
                     help="attribution knob: re-draw the holistic intent inside every plan, as the "
                          "pre-fix loop did, instead of once per episode (mc_rollout.py:160-169).")
+    ap.add_argument("--ablate-intent", default="none", choices=["none", "all", "hip", "iip"],
+                    help="mask part of the MIND intent stream in the CLOSED LOOP, on an already "
+                         "trained policy, to see what the policy actually uses. The 8 intent tokens "
+                         "are 4 holistic (HIP) then 4 immediate (IIP) -- intent_model.py:131 "
+                         "concatenates them in that order. 'all' removes the whole stream so the "
+                         "action head sees only text and proprio; 'hip' keeps the holistic half only; "
+                         "'iip' keeps the immediate half only. This is free -- no retraining -- but it "
+                         "answers only 'does the trained policy DEPEND on the intent', not 'does "
+                         "training with intent help', which needs a retrained ablation.")
     ap.add_argument("--residual", default=None,
                     help="a residual-PPO checkpoint (outputs/.../latest.pt) to apply on top of the "
                          "base policy. The residual acts EVERY control step, so it corrects at 50 Hz "
@@ -408,6 +417,30 @@ def main():
                           (float(step) / n_env.float()).clamp(max=1.0)[:, None],
                           (dur_s / 10.0)[:, None]], dim=-1)
 
+    # A checkpoint trained WITH an intent ablation must be evaluated with the same one, or the policy
+    # is handed tokens it never learned to read. The checkpoint records what it was trained with.
+    _trained_abl = ta.get("ablate_intent", "none")
+    if _trained_abl != "none" and args.ablate_intent == "none":
+        args.ablate_intent = _trained_abl
+        print(f"checkpoint was TRAINED with --ablate-intent {_trained_abl}; evaluating the same way",
+              flush=True)
+    elif _trained_abl != args.ablate_intent:
+        print(f"NOTE: checkpoint trained with intent ablation {_trained_abl!r}, evaluating with "
+              f"{args.ablate_intent!r} -- deliberate mismatch", flush=True)
+
+    def intent_keep(n_tok):
+        """Which of the policy's intent tokens stay visible. intent_model.py:131 concatenates the
+        holistic half first, then the immediate half, so the split is down the middle."""
+        if args.ablate_intent == "none":
+            return None
+        m = torch.zeros(B, n_tok, dtype=torch.bool, device=dev)
+        half = n_tok // 2
+        if args.ablate_intent == "hip":
+            m[:, :half] = True
+        elif args.ablate_intent == "iip":
+            m[:, half:] = True
+        return m
+
     t0 = time.time()
     step = 0
 
@@ -512,7 +545,7 @@ def main():
         x0 = sample_actions(model.policy, x_obs, obs_m, g,
                             txtC, (text_u, pooled_u, tlen_u),
                             scal, toks, num_steps=args.num_steps, cfg_scale=(cfgv if args.cfg_action < 0 else args.cfg_action),
-                            generator=gen)
+                            generator=gen, intent_valid=intent_keep(toks.shape[1]))
 
         return x0
 
@@ -701,6 +734,7 @@ def main():
                hold_action=args.hold_action, holi_per_plan=bool(args.holi_per_plan),
                cfg_action=(args.cfg_scale if args.cfg_action < 0 else args.cfg_action),
                hold=hold, n_future_proprio=n_fut_prop, ablate=ablate,
+               ablate_intent=args.ablate_intent,
                gen_hz=gen_hz, H=H, F=F, K=K,
                num_steps=args.num_steps, cfg_scale=args.cfg_scale, seed=args.seed,
                fall_rate=fall_rate, duration_completion=duration, n_fell=int((~alive).sum()),

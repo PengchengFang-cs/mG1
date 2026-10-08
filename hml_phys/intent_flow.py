@@ -98,7 +98,7 @@ def sample_latent(net, B, mem, mem_valid, mem_u, mem_valid_u, num_steps=32, cfg_
 
 @torch.no_grad()
 def sample_actions(policy, x_obs, observed_mask, gen, text, text_u, scalars, intent_tokens, num_steps=32,
-                   cfg_scale=3.5, generator=None, valid=None, frame_index=None):
+                   cfg_scale=3.5, generator=None, valid=None, frame_index=None, intent_valid=None):
     """Euler + x0-space CFG for the action-only policy. Conditional branch: (text, intent tokens); unconditional
     branch: (CLIP(''), no intent tokens) -- the same state as a text-dropped training sample."""
     B = x_obs.shape[0]
@@ -108,6 +108,11 @@ def sample_actions(policy, x_obs, observed_mask, gen, text, text_u, scalars, int
     grid = torch.linspace(0, 1, num_steps + 1, device=dev)
     K = intent_tokens.shape[1]
     ones = torch.ones(B, K, dtype=torch.bool, device=dev)
+    # `intent_valid` lets a caller mask part or all of the intent stream on the CONDITIONAL branch, so
+    # the trained policy's dependence on the intent can be ablated without retraining. None keeps every
+    # token, which is the behaviour every previous run had. The unconditional branch always masks all of
+    # them -- that is what makes it unconditional.
+    keep = ones if intent_valid is None else intent_valid.to(dev)
     for i in range(num_steps):
         t = grid[i].expand(B); dt = grid[i + 1] - grid[i]
         if cfg_scale != 1.0:
@@ -115,11 +120,11 @@ def sample_actions(policy, x_obs, observed_mask, gen, text, text_u, scalars, int
             x = policy(torch.cat([z, z]), cat2(observed_mask), torch.cat([t, t]),
                        torch.cat([text_u[0], text[0]]), torch.cat([text_u[1], text[1]]), torch.cat([text_u[2], text[2]]),
                        cat2(scalars), valid=cat2(valid), frame_index=cat2(frame_index),
-                       extra_tokens=cat2(intent_tokens), extra_valid=torch.cat([~ones, ones]))
+                       extra_tokens=cat2(intent_tokens), extra_valid=torch.cat([~ones, keep]))
             x = x[:B] + cfg_scale * (x[B:] - x[:B])
         else:
             x = policy(z, observed_mask, t, text[0], text[1], text[2], scalars, valid=valid, frame_index=frame_index,
-                       extra_tokens=intent_tokens, extra_valid=ones)
+                       extra_tokens=intent_tokens, extra_valid=keep)
         x = x.float()
         if i == num_steps - 1:
             return x * gen + x_obs * fixed
