@@ -145,13 +145,24 @@ def main():
     ev = HMLEvaluator(args.device)
     out = {}
 
+    def val(summary, *names):
+        """HMLEvaluator aggregates over replications, so each entry is dict(mean=, ci95=). With
+        replications pinned to 1 (CLAUDE.md §4) ci95 is identically 0, so only the mean is ever read
+        and nothing is ever reported as +-."""
+        for n in names:
+            if n in summary:
+                v = summary[n]
+                return float(v["mean"]) if isinstance(v, dict) else float(v)
+        return float("nan")
+
     # Rung 1: the GT against itself. For HumanML3D test this pipeline is known to give R@1 about 0.511
     # and FID about 0.002, so a wildly different value here means the GT path itself is broken.
     print("\nrung 1: kinematic GT against itself", flush=True)
     s1, _ = ev.evaluate(gt_items, None, replications=1)
     out["1_kinematic_gt"] = s1
-    print(f"  R@1 {s1['real_top1']:.4f}  R@2 {s1['real_top2']:.4f}  R@3 {s1['real_top3']:.4f}  "
-          f"MM-Dist {s1['real_mm_dist']:.4f}  Diversity {s1['real_diversity']:.4f}", flush=True)
+    print(f"  R@1 {val(s1, 'real_top1'):.4f}  R@2 {val(s1, 'real_top2'):.4f}  "
+          f"R@3 {val(s1, 'real_top3'):.4f}  MM-Dist {val(s1, 'real_mm_dist'):.4f}  "
+          f"Diversity {val(s1, 'real_diversity'):.4f}", flush=True)
 
     for label, items in rungs:
         if len(items) < 32:
@@ -162,7 +173,7 @@ def main():
         s, _ = ev.evaluate(gt_items, items, replications=1, gen_official_crop=False,
                            physics=False)
         out[label] = s
-        g = lambda k: s.get(k, s.get("gen_" + k, float("nan")))
+        g = lambda k: val(s, k, "gen_" + k)
         print(f"  R@1 {g('top1'):.4f}  R@2 {g('top2'):.4f}  R@3 {g('top3'):.4f}  "
               f"FID {g('fid'):.4f}  MM-Dist {g('mm_dist'):.4f}  Diversity {g('diversity'):.4f}",
               flush=True)
