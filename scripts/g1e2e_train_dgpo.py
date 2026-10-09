@@ -105,6 +105,18 @@ def main():
                          "varied and three quarters of the phase range was never trained.")
     ap.add_argument("--iters", type=int, default=500)
     ap.add_argument("--lr", type=float, default=1e-5)
+    ap.add_argument("--loser-weight", type=float, default=1.0,
+                    help="weight on the NEGATIVE-advantage branch. 1.0 is DGPO as specified; 0.0 keeps "
+                         "only the winners, which is rejection-sampling fine-tuning. v1 collapsed with "
+                         "this at 1.0: the fall rate went from 0.059 to 0.998 by iteration 11 while "
+                         "NEITHER reward improved, so it was not reward hacking but drift. The cause is "
+                         "that the loser branch MAXIMISES a denoising loss, which is unbounded above -- "
+                         "the frozen reference's loss on the policy's own samples rose 20-fold, and the "
+                         "manifold monitor went from 3.54 to 4.25, where STATUS.md §5.18 puts the "
+                         "already-hacked configurations. ThermoDPO reports RFT as a strong baseline on "
+                         "several held-out metrics, and RFT has no drift driver at all, so 0.0 is where "
+                         "to start; whether the preference branch earns its place is then a clean "
+                         "ablation rather than an assumption.")
     ap.add_argument("--epochs", type=int, default=4,
                     help="gradient passes over one batch of rollouts. The rollout is 15 of the 16.7 "
                          "minutes an iteration takes, so extra passes are nearly free, and without "
@@ -567,6 +579,8 @@ def main():
                   + a_sem.std(0) * args.w_sem)
         live = spread > args.live_frac * spread.mean().clamp_min(1e-9)
         adv = adv.clamp(-args.adv_clip, args.adv_clip) * live[None, :].float()
+        # The loser branch is what drove v1 off the manifold; this is the knob that removes it.
+        adv = adv.clamp_min(0) + args.loser_weight * adv.clamp_max(0)
 
         # ---- the DGPO update ---------------------------------------------------------------------
         # One shared noise level across everything, and ONE SHARED EPSILON PER GROUP: the reference
@@ -644,7 +658,8 @@ def main():
                  v_act=float(np.mean(ep_vratio)),
                  sd_surv=float(sd_surv), sd_sem=float(sd_sem),
                  use_surv=use_surv, use_sem=use_sem,
-                 adv_abs=float(adv.abs().mean()), live_groups=int(live.sum()),
+                 adv_abs=float(adv.abs().mean()), adv_pos=float((adv > 0).float().mean()),
+                 adv_neg=float((adv < 0).float().mean()), live_groups=int(live.sum()),
                  dsm=float(dsm_ng.mean()), ref_dsm=float(ref_dsm.mean()),
                  w=float(w.mean()), w_std=float(w.std()),
                  loss_dgpo=acc["dgpo"], loss_anchor=acc["anch"], loss_bc=acc["bc"],
