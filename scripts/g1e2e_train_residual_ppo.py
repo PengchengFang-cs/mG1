@@ -152,6 +152,33 @@ def main():
                          "Mean, not max: the left virtual hand carries a ~0.33 m near-constant "
                          "retargeting offset and took 90%% of the max, so the max had almost no "
                          "usable gradient. k=2 spans the measured 0.2-0.6 m range.")
+    ap.add_argument("--tmr", default=None,
+                    help="a text<->G1-motion retrieval checkpoint (outputs/g1e2e/tmr/best.pt). With "
+                         "--w-sem > 0 its text-motion distance becomes part of the reward. This is the "
+                         "fix for the measured defect: the teacher's reward contains NO text term, so "
+                         "a residual maximising it trades caption-following for reference-tracking -- "
+                         "R@1 fell from 0.33 to 0.16 with 21-joint authority and to 0.28 with 6 "
+                         "(STATUS.md §5.13b). Adding the term puts the thing we lost into the "
+                         "objective.")
+    ap.add_argument("--w-sem", type=float, default=0.0,
+                    help="weight on the semantic shaping term. 0 disables it and --tmr is then unused. "
+                         "The right magnitude is NOT known a priori: the term telescopes over an "
+                         "episode to w_sem x (final - first) text-motion distance, a swing of order "
+                         "0.5, against an episode return of order 35. 10 puts it near a tenth of the "
+                         "return. `r_sem_abs` and `sem_sim` are logged every iteration so the weight "
+                         "can be set from what it actually contributes rather than from this guess.")
+    ap.add_argument("--sem-every", type=int, default=25,
+                    help="control steps between semantic evaluations (50 = 1 s at 50 Hz). The "
+                         "retrieval model scores a SEQUENCE, so there is no per-step version of it.")
+    ap.add_argument("--sem-window", type=int, default=125,
+                    help="length of the trailing window scored, in control steps. A fixed window keeps "
+                         "every env the same length, so the whole batch encodes in one pass; envs that "
+                         "have not run this long yet get no semantic reward. 125 steps = 2.5 s = 50 "
+                         "frames at the retrieval model's 20 Hz, just above its 40-frame minimum. The "
+                         "first attempt used 250 and the semantic reward was identically zero: mean "
+                         "training episodes run 130-170 control steps (STATUS.md §5.11), so a 250-step "
+                         "window is only ever reached by the longest episodes -- precisely the ones "
+                         "already doing well, which is biased shaping as well as no shaping.")
     ap.add_argument("--rest-vel-thresh", type=float, default=0.1,
                     help="the reference counts as still when its mean body speed is below this (m/s)")
     ap.add_argument("--ref-dist", type=float, default=1.5,
@@ -195,6 +222,11 @@ def main():
     text_cache = Path(args.text_cache).resolve()
     for p in (refs, policy_path):
         assert p.exists(), p
+    # Resolved before the os.chdir to the legged_gym root below, or a relative path would resolve
+    # against the wrong directory -- the same defect --residual had in the evaluation script.
+    if args.tmr:
+        args.tmr = str(Path(args.tmr).resolve())
+        assert Path(args.tmr).exists(), args.tmr
     assert text_cache.is_dir(), text_cache
     assert (LEGGED_GYM / "resources/robots/g1/urdf/g1_21dof.urdf").exists(), "21-DoF asset missing"
     os.chdir(LEGGED_GYM)
@@ -439,6 +471,99 @@ def main():
                           (ep_step.float() / n_env.float()).clamp(max=1.0)[:, None],
                           (dur_s / 10.0)[:, None]], dim=-1)
 
+    # ---- semantic reward ---------------------------------------------------------------------------
+    sem = None
+    if args.w_sem:
+        assert args.tmr, "--w-sem needs --tmr"
+        from hml_phys.g1_tmr import TMR_FPS, load_tmr                       # noqa: E402
+        from hml_phys.evaluator import GLOVE_DIR, read_split, read_texts    # noqa: E402
+        from hml_phys.t2m.word_vectorizer import WordVectorizer             # noqa: E402
+        tmr, t_mean, t_std, t_meta = load_tmr(args.tmr, dev)
+        t_mean = torch.tensor(t_mean, device=dev)
+        t_std = torch.tensor(t_std, device=dev)
+        wv = WordVectorizer(GLOVE_DIR, "our_vab")
+        # Guo's text encoding, as hml_phys/evaluator.py and the TMR trainer both do it.
+        tok_by_key = {}
+        for sp in ("train", "test", "val"):
+            try:
+                names = read_split(sp)
+            except Exception:
+                continue
+            for nm in names:
+                try:
+                    tok_by_key.setdefault(nm, [t["tokens"] for t in read_texts(nm)])
+                except Exception:
+                    pass
+        MTL = 20
+
+        def enc_tok(tk):
+            if len(tk) < MTL:
+                tk = ["sos/OTHER"] + list(tk) + ["eos/OTHER"]
+                sl = len(tk)
+                tk = tk + ["unk/OTHER"] * (MTL + 2 - sl)
+            else:
+                tk = ["sos/OTHER"] + list(tk[:MTL]) + ["eos/OTHER"]
+                sl = len(tk)
+            e, o = zip(*[wv[t] for t in tk])
+            return np.stack(e).astype(np.float32), np.stack(o).astype(np.float32), sl
+
+        # A clip without POS tokens simply gets no semantic reward -- its env still trains on the
+        # teacher reward. Asserting here would refuse the whole run over one clip out of 512.
+        miss = [k for k in keys if k not in tok_by_key]
+        if miss:
+            print(f"semantic reward: {len(miss)}/{len(keys)} clips have no POS tokens "
+                  f"(e.g. {miss[:3]}); those envs get no semantic term", flush=True)
+        SEM_OK = torch.tensor([k in tok_by_key for k in keys], device=dev)
+        _dummy = ["unk/OTHER"]
+        we, po, cl = zip(*[enc_tok(tok_by_key.get(k, [_dummy])[0]) for k in keys])
+        cl = np.asarray(cl)
+        order = np.argsort(-cl, kind="stable")                         # packed GRU wants descending
+        inv = np.argsort(order)
+        with torch.inference_mode():
+            te = tmr.encode_text(torch.tensor(np.stack(we)[order], device=dev),
+                                 torch.tensor(np.stack(po)[order], device=dev),
+                                 torch.tensor(cl[order], device=dev).long())
+        TEXT_EMB = te[torch.tensor(inv, device=dev)].clone()            # back to env order, [B,512]
+        W = int(args.sem_window)
+        L20 = max(int(round(W / CONTROL_HZ * TMR_FPS)), 8)
+        sem = dict(buf=torch.zeros(B, W, PROPRIO_DIM, device=dev), ptr=0, W=W, L20=L20,
+                   prev=torch.zeros(B, device=dev), has=torch.zeros(B, dtype=torch.bool, device=dev))
+        print(f"semantic reward ON: {args.tmr} (held-out robot R@1 "
+              f"{t_meta.get('r1', float('nan')):.4f}), weight {args.w_sem}, every {args.sem_every} "
+              f"control steps on a {W}-step ({W / CONTROL_HZ:.1f} s) trailing window -> {L20} frames "
+              f"at {TMR_FPS} Hz", flush=True)
+
+    def sem_push(prop):
+        if sem is None:
+            return
+        sem["buf"][:, sem["ptr"]] = prop
+        sem["ptr"] = (sem["ptr"] + 1) % sem["W"]
+
+    def sem_reward():
+        """Potential-style shaping on the text-motion distance: the CHANGE in similarity since the
+        last evaluation. Reported as shaping, not as a policy-invariant potential -- the exact
+        invariant form would need gamma^sem_every discounting between evaluations.
+
+        Only envs that have run a full window are scored; the rest get 0, because the retrieval
+        model's encoder has never seen a stub shorter than its minimum length.
+        """
+        if sem is None:
+            return torch.zeros(B, device=dev), torch.zeros(B, device=dev)
+        p = sem["ptr"]
+        win = torch.cat([sem["buf"][:, p:], sem["buf"][:, :p]], 1)          # chronological
+        x = ((win - t_mean) / t_std).transpose(1, 2)
+        x = torch.nn.functional.interpolate(x, size=sem["L20"], mode="linear", align_corners=True)
+        with torch.inference_mode():
+            me = tmr.encode_motion(x.transpose(1, 2).contiguous(),
+                                   torch.full((B,), sem["L20"], device=dev, dtype=torch.long))
+        simil = -(TEXT_EMB - me).norm(dim=-1)                               # higher is better
+        ready = ep_step >= sem["W"]
+        r = torch.where(ready & sem["has"] & SEM_OK, args.w_sem * (simil - sem["prev"]),
+                        torch.zeros_like(simil))
+        sem["prev"] = torch.where(ready, simil, sem["prev"])
+        sem["has"] = sem["has"] | ready
+        return r, simil
+
     def extra_reward(obs_now, dof_vel):
         """The optional hand-rolled shaping. All three weights default to 0; see the docstring."""
         ref = obs_now[:, REF_SLICE]
@@ -474,7 +599,7 @@ def main():
         bv = torch.zeros(T, B, device=dev)
         br = torch.zeros(T, B, device=dev)
         bd = torch.zeros(T, B, device=dev)
-        acc = torch.zeros(4, device=dev)       # env reward, point error, |residual|, n resets
+        acc = torch.zeros(6, device=dev)   # env rew, point err, |residual|, resets, |r_sem|, sim
 
         for s in range(T):
             prop_now = read_prop()
@@ -498,6 +623,12 @@ def main():
             r = rew.detach() * args.rew_scale
             if args.w_track or args.w_alive or args.w_rest:
                 r = r + extra_reward(obs, env.dof_vel)
+            sem_push(read_prop())
+            if sem is not None and (s + it * T) % args.sem_every == 0:
+                r_sem, simil = sem_reward()
+                r = r + r_sem
+                acc[4] += r_sem.abs().mean()
+                acc[5] += simil.mean()
 
             timeout = env.time_out_buf.clone().bool()       # the clip simply ran out
             fell = dones.bool() & ~timeout                  # contact, tilt, or lost the reference
@@ -538,6 +669,11 @@ def main():
                 a_base[idx] = ha[idx]
                 prop_in[idx], applied_in[idx] = p[idx], ha[idx]
                 sample_holistic(idx)
+                if sem is not None:
+                    # A reset env's window still holds the previous episode. Marking it not-ready
+                    # stops it being scored until a full fresh window has accumulated.
+                    sem["has"][idx] = False
+                    sem["prev"][idx] = 0.0
 
             if boundary:
                 a_base = base_action().clone()
@@ -600,7 +736,7 @@ def main():
                      ep_ret=float(np.mean(done_ret[-256:])) if done_ret else float("nan"),
                      ep_len=float(np.mean(done_len[-256:])) if done_len else float("nan"),
                      fall_frac=float(np.mean(done_fell[-256:])) if done_fell else float("nan"),
-                     n_episodes=len(done_ret),
+                     n_episodes=len(done_ret), r_sem_abs=a[4], sem_sim=a[5],
                      loss_pi=pl / max(k, 1), loss_v=vl / max(k, 1), entropy=el / max(k, 1),
                      kl=kl / max(k, 1), updates=k, early_stop=stop,
                      log_std=float(res.log_std.mean()), minutes=(time.time() - t0) / 60)
@@ -609,7 +745,8 @@ def main():
             print(f"it {it} steps {m['env_steps']} rew {m['env_rew']:.3f} "
                   f"err {m['point_err_m']:.3f}m |d| {m['residual_abs']:.4f} "
                   f"ret {m['ep_ret']:.1f} r/s {m['ep_ret_per_step']:.3f} len {m['ep_len']:.0f} "
-                  f"fall {m['fall_frac']:.3f} kl {m['kl']:.4f} ls {m['log_std']:.2f} "
+                  f"fall {m['fall_frac']:.3f} sim {m['sem_sim']:.3f} "
+                  f"kl {m['kl']:.4f} ls {m['log_std']:.2f} "
                   f"{m['minutes']:.1f}min", flush=True)
             (out / "history.json").write_text(json.dumps(hist_json, indent=1))
 

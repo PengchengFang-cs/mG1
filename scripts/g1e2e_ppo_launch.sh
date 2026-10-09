@@ -47,4 +47,15 @@ python -u scripts/g1e2e_eval_closed_loop.py \
   --residual "$OUT/latest.pt" \
   --out outputs/g1e2e/eval_ppo_$TAG.json --device cuda:0
 echo "### $TAG EVAL_EXIT=$? $(date -Is)"
+
+# The semantic score, against our own robot-motion retrieval model. Reported next to pure cloning,
+# which is the row that matters: the residual's measured failure mode is losing caption-following.
+if [ -f "$REPO/outputs/g1e2e/tmr/best.pt" ]; then
+  python -u scripts/g1e2e_eval_semantic_tmr.py --tmr outputs/g1e2e/tmr/best.pt \
+    --npz bc=$REPO/outputs/g1e2e/tmr_bc.bodypos.npz \
+          $TAG=$REPO/outputs/g1e2e/eval_ppo_$TAG.bodypos.npz \
+    --real $REPO/data/g1_e2e/rollouts_test.ref.pkl \
+    --out $REPO/outputs/g1e2e/semantic_ppo_$TAG.json --device cuda
+  echo "### $TAG SEM_EXIT=$? $(date -Is)"
+fi
 echo "### $TAG done $(date -Is)"
