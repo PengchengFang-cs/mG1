@@ -20,15 +20,26 @@ deterministic ODE sampler we already use needs no conversion to an SDE -- which 
 
 A_g > 0 pushes that sample's denoising loss DOWN (fit the good rollout); A_g < 0 pushes it UP.
 
-THE GROUP IS G ROLLOUTS, NOT G IMAGES. In text-to-image a sample is scorable the moment it exists. An
-action chunk is not: its quality only appears once executed. So a group is G complete rollouts of the
-same caption from the same start state, differing only in the policy's sampling noise, and the reward
-is episodic -- which is the shape our rewards already have (did it fall; does the executed motion match
-the caption). Densifying an episodic reward is what produced the window bug in §5.17.
+THE GROUP IS G ROLLOUTS IN ONE ENV SLOT, NOT G ENVS. In text-to-image a sample is scorable the moment
+it exists. An action chunk is not: its quality only appears once executed. So a group is G complete
+rollouts of the same caption, and the reward is episodic -- which is the shape our rewards already have
+(did it fall; does the executed motion match the caption). Densifying an episodic reward is what
+produced the window defect in §5.17.
 
-Groups are built by duplicating each clip G times in the motion library, consecutively, so the env's
-own `begin_seq_motion_samples` / `forward_motion_samples` assign env j to clip j//G with no surgery,
-and each iteration advances to the next 512/G captions.
+The members must differ ONLY in the policy's sampling noise, or the group-relative advantage compares
+different problems. Putting G envs on one caption does NOT satisfy that, and a review caught it: with
+`terrain.curriculum False`, `legged_robot.py:2878-2903` draws an independent random terrain row per env
+and `terrain.py:81-100` gives each patch an independently drawn type and difficulty, so eight envs land
+on eight different surfaces (the chance all eight share a type is about 1.7%); and `config_eval.yaml:63`
+misspells `andomize_base_com`, so `randomize_base_com` stays True and every env carries its own
+U(-0.1, 0.1) m torso centre-of-mass bias. Both are drawn once at sim creation and never redrawn, so the
+same env slots would be punished in every iteration -- a constant per-slot term of the same order as the
+signal.
+
+So a group is G SEQUENTIAL PASSES THROUGH THE SAME ENV SLOT: identical terrain, identical centre of
+mass, identical reset state, differing only in the sampling generator. 512 envs then give 512 groups per
+update instead of 64, at G times the rollout cost -- the same cost per group, with groups that are
+actually controlled.
 
 MANIFOLD DRIFT is the known failure mode of exactly this objective. "Manifold Drift in Flow Preference
 Optimization" (arXiv 2608.20011) shows FlowDPO's loss is the winner's flow-matching error minus the
@@ -36,9 +47,12 @@ loser's, and that subtracting the loser term is what pushes terminal samples off
 manifold; DGPO's `A_g < 0` branch is that term. Their fix is a winner-side anchor. Ours is two things:
 a plain denoising loss on RECORDED data mixed in (`--w-anchor`), which is the same anchor the DGPO
 recipe already suggested as an optional small term and which is promoted here to a first-class one;
-and an EMA reference rather than a fixed one, because three independent results say a fixed-reference
-KL is not enough (it changes the optimisation timescale, it fails under heavy-tailed reward error, and
-its coefficient is sharply sensitive).
+an EMA reference rather than a fixed one, because three independent results say a fixed-reference KL is
+not enough (it changes the optimisation timescale, it fails under heavy-tailed reward error, and its
+coefficient is sharply sensitive); and -- because both of those tethers are self-referential, the anchor
+being the policy's own winners and the EMA reference following the policy within a few hundred
+iterations -- a small pull toward the FROZEN starting checkpoint, which is the one thing here that
+actually represents the recorded data, having been trained on all 136k trajectories.
 
 REWARD, with the Stage 0 guards (STATUS.md §5.18):
     survival   -1 if it fell, plus the fraction of the window survived
@@ -77,28 +91,44 @@ def main():
     ap.add_argument("--tmr-judge", required=True,
                     help="a retrieval model that never enters the reward; the monitor runs in its space")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--group", type=int, default=8, help="rollouts per caption")
+    ap.add_argument("--group", type=int, default=4,
+                    help="rollouts per caption, run as G SEQUENTIAL PASSES THROUGH THE SAME ENV SLOT")
     ap.add_argument("--num-envs", type=int, default=512)
-    ap.add_argument("--n-clips", type=int, default=512,
-                    help="distinct captions cycled through; each is duplicated --group times")
-    ap.add_argument("--episode-steps", type=int, default=150,
-                    help="control steps per rollout. 150 = 3 s, above the retrieval model's 2 s "
-                         "minimum, and it keeps one DGPO update near a minute.")
+
+    ap.add_argument("--episode-steps", type=int, default=300,
+                    help="control steps per rollout. Measured: the 512 captions have a median clip of "
+                         "7.80 s = 390 control steps, so 300 covers 77%% of the median and gives the "
+                         "progress scalar most of its range, and 300 steps is 120 frames at the "
+                         "retrieval model's 20 Hz -- inside the [40, 196] range it was trained on. The "
+                         "first attempt used 150, which covered 38%% of a median clip and left 484 of "
+                         "512 clips unable to finish inside the window, so the survival term barely "
+                         "varied and three quarters of the phase range was never trained.")
     ap.add_argument("--iters", type=int, default=500)
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--beta-dpo", type=float, default=30.0, help="DGPO recipe: 10-100 with a frozen ref")
     ap.add_argument("--adv-clip", type=float, default=5.0)
-    ap.add_argument("--ema", type=float, default=0.995,
-                    help="EMA rate for the reference. GARDO (arXiv 2512.24138) rolls the reference "
-                         "rather than fixing it, because a fixed reference's penalty grows as the "
-                         "policy improves and eventually swamps the RL term.")
+    ap.add_argument("--live-frac", type=float, default=0.1,
+                    help="a group is skipped when its reward spread is below this fraction of the "
+                         "batch spread. An absolute 1e-6 floor never fires on continuous retrieval "
+                         "distances, so a group whose members are all equally good would otherwise "
+                         "contribute a FULL-magnitude gradient derived from float noise.")
+    ap.add_argument("--w-bc", type=float, default=0.05,
+                    help="pull toward the FROZEN starting checkpoint in x0 space. This is the only "
+                         "term here that tethers the policy to the recorded data -- the winner anchor's "
+                         "target is the policy's own sample, so it moves with the policy. Against "
+                         "manifold drift, which is the documented failure of exactly this objective, a "
+                         "self-referential tether is no tether.")
     ap.add_argument("--w-anchor", type=float, default=0.3,
                     help="weight on the WINNER-SIDE ANCHOR against manifold drift: a plain denoising "
                          "loss on the samples with positive advantage, weighted by (1-t)^2. This is "
                          "ThermoDPO's structure (arXiv 2608.20011) -- that paper proves its objective "
                          "reduces to rejection-sampling fine-tuning as its temperature goes to zero, "
-                         "and its experiments use the (1-t)^2 reweighting because the plain t^2 factor "
-                         "weakens the anchor exactly where it is needed, near t = 0. It needs no extra "
+                         "and its experiments reweight the winner term so the anchor is not weakened "
+                         "at the CLEAN end of the schedule. That paper writes (1-t)^2 in the SD3 "
+                         "convention where t = 0 is clean; this repo uses the opposite convention "
+                         "(hml_phys/flow.py:2, t = 1 clean), so the same thing is t^2 HERE. Writing "
+                         "(1-t)^2 put 0.87 of the weight at the noisy end and 0.07 at the clean end -- "
+                         "backwards, and weakest exactly where terminal-sample drift appears. It needs no extra "
                          "data: the winners of the group ARE the anchor. 0 disables it, which is the "
                          "ablation that shows whether it was needed.")
     ap.add_argument("--keep-per-ep", type=int, default=4,
@@ -110,6 +140,16 @@ def main():
     ap.add_argument("--num-steps", type=int, default=10, help="flow sampling steps")
     ap.add_argument("--cfg-action", type=float, default=1.0)
     ap.add_argument("--cfg-scale", type=float, default=2.5)
+    ap.add_argument("--manifold-from", default="",
+                    help="recorded rollouts defining the data manifold. The monitor is the mean "
+                         "distance to the k nearest recorded motions, computed in the JUDGE's "
+                         "embedding space, because STATUS.md §5.18 measured that the outlier statistic "
+                         "carries no signal in the reward model's own space. Empty disables it, which "
+                         "leaves the documented failure mode of this objective undetected for the "
+                         "whole run.")
+    ap.add_argument("--manifold-n", type=int, default=1500)
+    ap.add_argument("--manifold-knn", type=int, default=10)
+    ap.add_argument("--resume", action="store_true", help="continue from <out>/latest.pt")
     ap.add_argument("--save-every", type=int, default=25)
     ap.add_argument("--max-hours", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=0)
@@ -117,7 +157,7 @@ def main():
     args, overrides = ap.parse_known_args()
     bad = [o for o in overrides if o.startswith("-")]
     assert not bad, f"unrecognised option(s) {bad}; hydra overrides are key=value, not flags"
-    assert args.num_envs % args.group == 0, "--num-envs must be a multiple of --group"
+
 
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -130,21 +170,8 @@ def main():
         assert Path(p).exists(), p
     assert text_cache.is_dir(), text_cache
 
-    # The duplicated library is built BEFORE the chdir, while relative paths still mean what they say.
     import joblib
-    dup = refs.parent / f"{refs.stem}.dup{args.group}x{args.n_clips}.pkl"
-    if not dup.exists():
-        print(f"building the duplicated library {dup.name} ...", flush=True)
-        lib = joblib.load(refs)
-        keys = list(lib)[:args.n_clips]
-        d = {}
-        for k in keys:
-            for g in range(args.group):
-                e = dict(lib[k])
-                e["base_key"] = k
-                d[f"{k}#g{g}"] = e
-        joblib.dump(d, dup)
-        print(f"  {len(keys)} clips x {args.group} = {len(d)} entries", flush=True)
+
     os.chdir(LEGGED_GYM)
     sys.path.insert(0, str(H2H))
     sys.path.insert(0, str(REPO))
@@ -160,8 +187,7 @@ def main():
 
     from hml_phys.g1e2e_data import PROPRIO_DIM, ACTION_DIM, TOKEN_DIM          # noqa: E402
     from hml_phys.g1e2e_flow import (action_channel_mask, build_state_elem,      # noqa: E402
-                                     generated_elements, observed_mask,
-                                     policy_loss, velocity_pair)
+                                     generated_elements, observed_mask, velocity_pair)
     from hml_phys.intent_model import IntentPolicy                              # noqa: E402
     from hml_phys.intent_vae import IntentVAE                                   # noqa: E402
     from hml_phys.intent_flow import (intent_hidden, sample_actions,            # noqa: E402
@@ -184,10 +210,16 @@ def main():
 
     with hydra.initialize_config_dir(version_base=None, config_dir=str(CFG_DIR)):
         cfg_h = hydra.compose(config_name="config_eval", overrides=[
-            f"motion.motion_file={dup}", f"num_envs={args.num_envs}", f"sim_device={args.device}",
+            f"motion.motion_file={refs}", f"num_envs={args.num_envs}", f"sim_device={args.device}",
             "headless=True", "use_wandb=False",
             "asset.terminate_by_ref_motion_distance=False",   # no reference at deployment, so none here
-            "asset.terminate_by_1time_motion=True",
+            # OFF, as in the evaluation script: with it on, a clip simply ENDING is routed into
+            # `dones` and would be counted as a fall. 27 of the 512 clips are shorter than 3 s.
+            "asset.terminate_by_1time_motion=False",
+            # The typo `andomize_base_com` in config_eval.yaml:63 leaves base-CoM randomisation ON, so
+            # every env carries its own +-0.1 m torso centre-of-mass bias for the whole run. Harmless
+            # when each env is its own measurement; fatal when envs are compared to each other.
+            "domain_rand.randomize_base_com=False",
             "motion.resample_motions_for_envs=False",
             "rewards.penalty_curriculum=False",
             *overrides])
@@ -230,13 +262,19 @@ def main():
     model.eval()
     for n, p in model.named_parameters():
         p.requires_grad_(n.startswith("policy."))
-    ref = build_policy()                       # the EMA reference
+    # FROZEN, not an EMA. The recipe specifies beta_dpo 10-100 "with a frozen reference", and the
+    # reference implementation freezes it by default with EMA only as an option. A reference that
+    # tracks the policy drives `dsm - ref_dsm` toward zero, which pins `w` at sigmoid(0) = 0.5 and
+    # makes the whole objective plain advantage-weighted denoising with --beta-dpo inert. It is also
+    # the only thing here that represents the recorded data, having been trained on all 136k
+    # trajectories, so freezing it is what gives --w-bc something real to pull toward.
+    ref = build_policy()
     ref.eval().requires_grad_(False)
     trainable = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0)
     print(f"trainable: {sum(p.numel() for p in trainable) / 1e6:.1f} M of "
           f"{sum(p.numel() for p in model.parameters()) / 1e6:.1f} M (the action policy only); "
-          f"EMA reference at {args.ema}", flush=True)
+          f"frozen reference", flush=True)
 
     # ---- reward: min over disjoint-slice models; judge kept apart --------------------------------
     rew_tmrs, rew_norm = [], []
@@ -285,21 +323,67 @@ def main():
         e, o = zip(*[wv[t] for t in tk])
         return np.stack(e).astype(np.float32), np.stack(o).astype(np.float32), sl
 
+    s_read = float(ta["cond_aug_test"])
+    _lat = np.load(policy_path.parent / "intent_latent_stats.npz")
+    lat_mean = torch.tensor(_lat["mean"], device=dev)
+    lat_std = torch.tensor(_lat["std"], device=dev)
     env.cfg.env.test = True
     env.begin_seq_motion_samples()
     act_mask = action_channel_mask(dev)
     gen = torch.Generator(device=dev).manual_seed(args.seed)
     W20 = max(int(round(args.episode_steps / CONTROL_HZ * TMR_FPS)), 8)
 
-    hist_json, t0 = [], time.time()
-    for it in range(1, args.iters + 1):
+    # ---- the manifold monitor, in the JUDGE's space ---------------------------------------------
+    # STATUS.md §5.18 measured this: mean k-NN distance to recorded robot motion tracks R@1 monotonically
+    # in both embedding spaces, while the outlier fraction carries signal ONLY in the judge's space.
+    # The monitor therefore lives here, computed on the same window as the reward but with the model
+    # that never enters it.
+    man_ref = None
+    if args.manifold_from:
+        rec = joblib.load(args.manifold_from)
+        fs = []
+        for k, v in list(rec.items())[:args.manifold_n]:
+            f = np.asarray(v["proprio"], dtype=np.float32)
+            if len(f) >= 100:
+                fs.append(f)
+        embs = []
+        with torch.inference_mode():
+            for b in range(0, len(fs), 128):
+                chunk = fs[b:b + 128]
+                mx = min(max(len(f) for f in chunk), 10 * W20)
+                buf = torch.zeros(len(chunk), W20, PROPRIO_DIM, device=dev)
+                for q, f in enumerate(chunk):
+                    t_ = torch.tensor(f[:mx], device=dev)[None].transpose(1, 2)
+                    buf[q] = torch.nn.functional.interpolate(
+                        t_, size=W20, mode="linear", align_corners=True)[0].T
+                embs.append(judge.encode_motion((buf - j_mu) / j_sd,
+                                                torch.full((len(chunk),), W20, device=dev,
+                                                           dtype=torch.long)).clone())
+        man_ref = torch.cat(embs, 0)
+        print(f"manifold reference: {man_ref.shape[0]} recorded motions in the judge's space", flush=True)
+
+    hist_json, t0, it0 = [], time.time(), 0
+    if args.resume and (out / "latest.pt").exists():
+        rck = torch.load(out / "latest.pt", map_location=dev)
+        model.load_state_dict(rck["model"])
+        if "opt" in rck:
+            opt.load_state_dict(rck["opt"])
+        it0 = int(rck.get("iter", 0))
+        print(f"resumed at iteration {it0}", flush=True)
+
+    def read_prop():
+        return torch.cat([env.base_lin_vel, env.base_ang_vel, env.projected_gravity,
+                          env.dof_pos, env.dof_vel], dim=-1)
+
+    for it in range(it0 + 1, args.iters + 1):
         if it > 1:
-            env.forward_motion_samples()      # next NG captions, all envs reset
+            env.forward_motion_samples()      # the next B captions; all envs reset
         lib_ids = env._motion_lib._curr_motion_ids.clone()
-        keys = [str(k) for k in env._motion_lib._motion_data_keys[lib_ids.cpu().numpy()]]
-        base = [k.split("#g")[0] for k in keys]
-        for j in range(NG):                   # the duplication must line up with the grouping
-            assert len(set(base[j * G:(j + 1) * G])) == 1, f"group {j} is not one caption: {base[j*G:(j+1)*G]}"
+        n_uni = env._motion_lib._num_unique_motions
+        assert torch.equal(lib_ids, (torch.arange(B, device=lib_ids.device) + env.start_idx) % n_uni), (
+            "env j is not library entry j; the per-env caption mapping the whole method rests on is "
+            "broken (motion_lib_base.py:280-286)")
+        base = [str(k) for k in env._motion_lib._motion_data_keys[lib_ids.cpu().numpy()]]
 
         text = torch.stack([torch.tensor(tok[k][0], dtype=torch.float32) for k in base]).to(dev)
         pooled = torch.stack([torch.tensor(pool[k][0], dtype=torch.float32) for k in base]).to(dev)
@@ -310,16 +394,13 @@ def main():
         with torch.inference_mode():
             mem_c, mv_c = model.adapter(text, tlen)
             mem_u, mv_u = model.adapter(text_u, tlen_u)
-        s_read = float(ta["cond_aug_test"])
-        lat_st = np.load(policy_path.parent / "intent_latent_stats.npz")
-        lat_mean = torch.tensor(lat_st["mean"], device=dev)
-        lat_std = torch.tensor(lat_st["std"], device=dev)
         dur_s = env._motion_lib.get_motion_length().clone().to(dev).float()
+        assert dur_s.shape[0] == B, f"{dur_s.shape[0]} motion lengths for {B} envs"
         n_env = (dur_s * CONTROL_HZ).ceil().long().clamp_min(1)
 
-        # the retrieval models' text embeddings for this window, one caption per env
-        ok = torch.tensor([k in pos_by_key for k in base], device=dev)
-        we, po, cl = zip(*[enc_pos(pos_by_key.get(k, [["unk/OTHER"]])[0]) for k in base])
+        miss = [k for k in base if k not in pos_by_key]
+        assert not miss, f"{len(miss)} captions have no POS tokens, e.g. {miss[:3]}"
+        we, po, cl = zip(*[enc_pos(pos_by_key[k][0]) for k in base])
         cl = np.asarray(cl)
         order = np.argsort(-cl, kind="stable")
         inv = torch.tensor(np.argsort(order), device=dev)
@@ -330,168 +411,240 @@ def main():
             rew_text = [m.encode_text(wet, pot, clt)[inv].clone() for m in rew_tmrs]
             judge_text = judge.encode_text(wet, pot, clt)[inv].clone()
 
-        # ---- roll the group out -------------------------------------------------------------------
-        obs, _ = env.reset()
-        hist = torch.zeros(B, H, TOKEN_DIM, device=dev)
-
-        def read_prop():
-            return torch.cat([env.base_lin_vel, env.base_ang_vel, env.projected_gravity,
-                              env.dof_pos, env.dof_vel], dim=-1)
-
-        hold_a = (env.dof_pos - env.default_dof_pos) / float(cfg.control.action_scale)
-        hist[:, :, :PROPRIO_DIM] = ((read_prop() - mean[:PROPRIO_DIM]) / std[:PROPRIO_DIM])[:, None, :]
-        hist[:, :, PROPRIO_DIM:] = ((hold_a - mean[PROPRIO_DIM:]) / std[PROPRIO_DIM:])[:, None, :]
-        with torch.inference_mode():
-            I_H = sample_latent(model.hip, B, mem_c, mv_c, mem_u, mv_u, num_steps=args.num_steps,
-                                cfg_scale=args.cfg_scale, generator=gen, device=dev)
-            hH_c = intent_hidden(model.hip, I_H, s_read, gen, mem=mem_c, mem_valid=mv_c)
-            hH_u = intent_hidden(model.hip, I_H, s_read, gen, mem=mem_u, mem_valid=mv_u)
-
-        alive = torch.ones(B, dtype=torch.bool, device=dev)
-        fall_step = torch.full((B,), args.episode_steps, dtype=torch.long, device=dev)
-        prop_buf = torch.zeros(B, args.episode_steps, PROPRIO_DIM, device=dev)
+        # ---- G sequential passes through the SAME env slots -------------------------------------
+        R_surv = torch.zeros(G, B, device=dev)
+        R_sem = torch.zeros(G, B, device=dev)
+        keptG, ep_fall, ep_vratio, ep_man = [], [], [], []
         n_plan = (args.episode_steps + hold - 1) // hold
         keep = sorted(np.random.RandomState(args.seed + it).choice(
             n_plan, size=min(args.keep_per_ep, n_plan), replace=False).tolist())
-        kept = []       # (x_obs, obs_m, gmask, toks, scal, x0) for the DGPO update
 
-        step, plan_i = 0, 0
-        while step < args.episode_steps:
+        for g in range(G):
+            gg = torch.Generator(device=dev).manual_seed(args.seed * 100003 + it * 97 + g)
+            obs, _ = env.reset()
+            hist = torch.zeros(B, H, TOKEN_DIM, device=dev)
+            hold_a = (env.dof_pos - env.default_dof_pos) / float(cfg.control.action_scale)
+            p0 = read_prop()
+            hist[:, :, :PROPRIO_DIM] = ((p0 - mean[:PROPRIO_DIM]) / std[:PROPRIO_DIM])[:, None, :]
+            hist[:, :, PROPRIO_DIM:] = ((hold_a - mean[PROPRIO_DIM:]) / std[PROPRIO_DIM:])[:, None, :]
             with torch.inference_mode():
-                x_obs = torch.zeros(B, H + F, TOKEN_DIM, device=dev)
-                x_obs[:, :H] = hist
-                obs_m = observed_mask(B, H, H + F, dev)
-                gmask = generated_elements(obs_m, None, act_mask)
-                if n_fut_prop > 0:
-                    x_obs[:, H, :PROPRIO_DIM] = (read_prop() - mean[:PROPRIO_DIM]) / std[:PROPRIO_DIM]
-                _, mu_h, _ = vae.encode(hist[:, :, :PROPRIO_DIM])
-                lat_h = (mu_h - lat_mean) / lat_std
-                scal = torch.stack([(torch.full((B,), float(step), device=dev)
-                                     / n_env.float()).clamp(max=1.0), dur_s / 10.0], -1)
-                I_I = sample_latent(model.iip, B, mem_c, mv_c, mem_u, mv_u, num_steps=args.num_steps,
-                                    cfg_scale=args.cfg_scale, generator=gen, prefix=lat_h,
-                                    scalars=scal, extra=hH_c, extra_u=hH_u, device=dev)
-                hI_c = intent_hidden(model.iip, I_I, s_read, gen, mem=mem_c, mem_valid=mv_c,
-                                     prefix_latent=lat_h, scalars=scal, mem_extra=hH_c)
-                toks, _ = model.intent_tokens(hH_c, hI_c,
-                                              torch.ones(B, dtype=torch.bool, device=dev))
-                x0 = sample_actions(model.policy, x_obs, obs_m, gmask, (text, pooled, tlen),
-                                    (text_u, pooled_u, tlen_u), scal, toks,
-                                    num_steps=args.num_steps, cfg_scale=args.cfg_action,
-                                    generator=gen)
-            if plan_i in keep:
-                kept.append(tuple(t.clone() for t in (x_obs, obs_m, gmask, toks, scal, x0)))
-            a_raw = x0[:, H, PROPRIO_DIM:] * std[PROPRIO_DIM:] + mean[PROPRIO_DIM:]
-            prop_in = read_prop()
-            applied = a_raw
-            for _ in range(hold):
-                if step >= args.episode_steps:
-                    break
-                prop_buf[:, step] = read_prop()
-                obs, _, _, dones, _ = env.step(a_raw.detach())
-                newly = dones.bool() & alive
-                fall_step[newly] = step
-                alive &= ~newly
-                step += 1
-            hist = torch.roll(hist, -1, dims=1)
-            hist[:, -1, :PROPRIO_DIM] = (prop_in - mean[:PROPRIO_DIM]) / std[:PROPRIO_DIM]
-            hist[:, -1, PROPRIO_DIM:] = (applied - mean[PROPRIO_DIM:]) / std[PROPRIO_DIM:]
-            plan_i += 1
+                I_H = sample_latent(model.hip, B, mem_c, mv_c, mem_u, mv_u, num_steps=args.num_steps,
+                                    cfg_scale=args.cfg_scale, generator=gg, device=dev)
+                hH_c = intent_hidden(model.hip, I_H, s_read, gg, mem=mem_c, mem_valid=mv_c)
+                hH_u = intent_hidden(model.hip, I_H, s_read, gg, mem=mem_u, mem_valid=mv_u)
 
-        # ---- episodic reward ----------------------------------------------------------------------
-        fell = ~alive
-        r_surv = fall_step.float() / args.episode_steps - fell.float()
-        feat = torch.nn.functional.interpolate(prop_buf.transpose(1, 2), size=W20, mode="linear",
-                                               align_corners=True).transpose(1, 2).contiguous()
-        sims = []
-        with torch.inference_mode():
-            for m, (mu, sd), te in zip(rew_tmrs, rew_norm, rew_text):
-                me = m.encode_motion((feat - mu) / sd,
-                                     torch.full((B,), W20, device=dev, dtype=torch.long))
-                sims.append(-(te - me).norm(dim=-1))
-            jm = judge.encode_motion((feat - j_mu) / j_sd,
-                                     torch.full((B,), W20, device=dev, dtype=torch.long))
-            judge_sim = -(judge_text - jm).norm(dim=-1)
-        r_sem = torch.stack(sims, 0).min(0).values          # conservative aggregation
-        r_sem = torch.where(ok, r_sem, r_sem.mean().expand_as(r_sem))
+            alive = torch.ones(B, dtype=torch.bool, device=dev)
+            fall_step = torch.full((B,), args.episode_steps, dtype=torch.long, device=dev)
+            prop_buf = torch.zeros(B, args.episode_steps, PROPRIO_DIM, device=dev)
+            kept = []
+            step, plan_i = 0, 0
+            while step < args.episode_steps:
+                with torch.inference_mode():
+                    x_obs = torch.zeros(B, H + F, TOKEN_DIM, device=dev)
+                    x_obs[:, :H] = hist
+                    obs_m = observed_mask(B, H, H + F, dev)
+                    gmask = generated_elements(obs_m, None, act_mask)
+                    # Only row H is executed (K = 1). The episodic reward cannot speak for rows H+1:,
+                    # so they are excluded from the objective rather than given credit they did not earn.
+                    gmask = gmask.clone()
+                    gmask[:, H + 1:] = 0
+                    if n_fut_prop > 0:
+                        x_obs[:, H, :PROPRIO_DIM] = (read_prop() - mean[:PROPRIO_DIM]) / std[:PROPRIO_DIM]
+                    _, mu_h, _ = vae.encode(hist[:, :, :PROPRIO_DIM])
+                    lat_h = (mu_h - lat_mean) / lat_std
+                    scal = torch.stack([(torch.full((B,), float(step), device=dev)
+                                         / n_env.float()).clamp(max=1.0), dur_s / 10.0], -1)
+                    I_I = sample_latent(model.iip, B, mem_c, mv_c, mem_u, mv_u,
+                                        num_steps=args.num_steps, cfg_scale=args.cfg_scale,
+                                        generator=gg, prefix=lat_h, scalars=scal,
+                                        extra=hH_c, extra_u=hH_u, device=dev)
+                    hI_c = intent_hidden(model.iip, I_I, s_read, gg, mem=mem_c, mem_valid=mv_c,
+                                         prefix_latent=lat_h, scalars=scal, mem_extra=hH_c)
+                    toks, _ = model.intent_tokens(hH_c, hI_c,
+                                                  torch.ones(B, dtype=torch.bool, device=dev))
+                    x0 = sample_actions(model.policy, x_obs, obs_m, gmask, (text, pooled, tlen),
+                                        (text_u, pooled_u, tlen_u), scal, toks,
+                                        num_steps=args.num_steps, cfg_scale=args.cfg_action,
+                                        generator=gg)
+                if plan_i in keep:
+                    # `alive` is stored with the sample: a chunk generated after this env's own
+                    # termination was produced from a history that straddles the auto-reset, and it
+                    # must not carry the episode's advantage.
+                    kept.append((obs_m.clone(), gmask.clone(), toks.clone(), scal.clone(),
+                                 x0.clone(), alive.clone()))
+                a_raw = x0[:, H, PROPRIO_DIM:] * std[PROPRIO_DIM:] + mean[PROPRIO_DIM:]
+                prop_in = read_prop()
+                for _ in range(hold):
+                    if step >= args.episode_steps:
+                        break
+                    prop_buf[:, step] = read_prop()
+                    obs, _, _, dones, _ = env.step(a_raw.detach())
+                    # A fall only counts INSIDE the clip's own length, exactly as the evaluation
+                    # script scores it; `terminate_by_1time_motion` is off so a clip ending is not a
+                    # done at all, but a short clip's env keeps stepping past its end.
+                    newly = dones.bool() & alive & (torch.full((B,), step, device=dev) < n_env)
+                    fall_step[newly] = step
+                    alive &= ~newly
+                    step += 1
+                hist = torch.roll(hist, -1, dims=1)
+                hist[:, -1, :PROPRIO_DIM] = (prop_in - mean[:PROPRIO_DIM]) / std[:PROPRIO_DIM]
+                hist[:, -1, PROPRIO_DIM:] = (a_raw - mean[PROPRIO_DIM:]) / std[PROPRIO_DIM:]
+                plan_i += 1
 
-        # variance-normalise each term before summing (MO-GRPO)
-        nrm = lambda v: v / v.std().clamp_min(1e-6)
-        r = args.w_surv * nrm(r_surv) + args.w_sem * nrm(r_sem)
-        rg = r.view(NG, G)
-        adv = ((rg - rg.mean(1, keepdim=True)) / rg.std(1, keepdim=True).clamp_min(1e-6)) \
-            .clamp(-args.adv_clip, args.adv_clip).reshape(-1)
-        live = rg.std(1) > 1e-6                              # a group with no spread teaches nothing
-        adv = adv * live.repeat_interleave(G).float()
+            # ---- this pass's episodic rewards, on each env's OWN valid prefix -------------------
+            n_valid = torch.minimum(fall_step, torch.minimum(n_env, torch.full_like(n_env,
+                                                                                   args.episode_steps)))
+            R_surv[g] = n_valid.float() / args.episode_steps - (~alive).float()
+            m20 = (n_valid.float() / CONTROL_HZ * TMR_FPS).round().long().clamp(40, W20)
+            feat = torch.zeros(B, W20, PROPRIO_DIM, device=dev)
+            for j in range(B):                       # each env resamples its own prefix, not the pad
+                nv = int(n_valid[j])
+                if nv < 8:
+                    continue
+                src = prop_buf[j, :nv].T[None]
+                feat[j, :int(m20[j])] = torch.nn.functional.interpolate(
+                    src, size=int(m20[j]), mode="linear", align_corners=True)[0].T
+            sc = n_valid >= 100                      # below 40 frames the encoder is out of distribution
+            ml = m20.clone()
+            srt = torch.argsort(ml, descending=True)
+            isrt = torch.argsort(srt)
+            with torch.inference_mode():
+                sims = []
+                for m, (mu, sd), te in zip(rew_tmrs, rew_norm, rew_text):
+                    me = m.encode_motion(((feat - mu) / sd)[srt], ml[srt])[isrt]
+                    sims.append(-(te - me).norm(dim=-1))
+                jm = judge.encode_motion(((feat - j_mu) / j_sd)[srt], ml[srt])[isrt]
+                jsim = -(judge_text - jm).norm(dim=-1)
+                if man_ref is not None:
+                    ep_man.append(float(torch.cdist(jm, man_ref).topk(
+                        args.manifold_knn, dim=1, largest=False).values.mean()))
+            R_sem[g] = torch.stack(sims, 0).min(0).values      # conservative aggregation
+            R_sem[g] = torch.where(sc, R_sem[g], torch.full_like(R_sem[g], float("nan")))
+            keptG.append(kept)
+            ep_fall.append(float((~alive).float().mean()))
+            v_act = (prop_buf[:, :, :2].norm(dim=-1).sum(1) / n_valid.clamp_min(1).float())
+            ep_vratio.append(float(v_act.mean()))
+            ep_jsim = float(jsim[sc].mean()) if bool(sc.any()) else float("nan")
+
+        # ---- rewards -> within-group normalisation -> advantage ---------------------------------
+        # Each term is divided by the pooled std of its WITHIN-GROUP residuals, not of the batch.
+        # A per-caption offset cancels when the group is centred but inflates a batch std, so a batch
+        # std silently shrinks whichever term varies most between captions -- which is exactly the
+        # semantic term. And the group is centred WITHOUT a second standardisation, because dividing
+        # each group by its own spread erases the weights entirely.
+        def within(v):
+            r = v - v.nanmean(0, keepdim=True)
+            sd = r[~torch.isnan(r)].std()
+            return r / sd.clamp_min(1e-3), sd
+
+        a_surv, sd_surv = within(R_surv)
+        a_sem, sd_sem = within(torch.nan_to_num(R_sem, nan=float("nan")))
+        a_sem = torch.nan_to_num(a_sem, nan=0.0)              # unscoreable envs get no semantic signal
+        use_surv = float(sd_surv) > 1e-3
+        use_sem = float(sd_sem) > 1e-3
+        adv = (args.w_surv * a_surv if use_surv else 0.0) + (args.w_sem * a_sem if use_sem else 0.0)
+        if not torch.is_tensor(adv):
+            print(f"it {it}: neither reward term has within-group spread; skipping", flush=True)
+            continue
+        spread = (R_surv.std(0) * (args.w_surv / max(float(sd_surv), 1e-3))
+                  + a_sem.std(0) * args.w_sem)
+        live = spread > args.live_frac * spread.mean().clamp_min(1e-9)
+        adv = adv.clamp(-args.adv_clip, args.adv_clip) * live[None, :].float()
 
         # ---- the DGPO update ---------------------------------------------------------------------
-        # One shared noise level AND one shared epsilon across the WHOLE batch, per the DGPO recipe
-        # (`use_shared_noise`): the group's samples must be compared at the same point of the schedule.
+        # One shared noise level across everything, and ONE SHARED EPSILON PER GROUP: the reference
+        # implementation draws one noise tensor per group and indexes it, so the members differ only in
+        # their own x0. Here a group is the G passes of one env slot, so epsilon is shared across g.
         t_shared = fl.sample_t(1, dev, generator=gen).expand(B)
-        ones_tok = torch.ones(B, kept[0][3].shape[1], dtype=torch.bool, device=dev)
-        zs = []
-        for (x_obs, obs_m, gmask, toks, scal, x0) in kept:
-            z, _ = build_state_elem(x0, gmask, t_shared, generator=gen)
-            zs.append(z)
+        K = len(keptG[0])
+        eps = [torch.randn(keptG[0][k][4].shape, device=dev, generator=gen) for k in range(K)]
+        ones_tok = torch.ones(B, keptG[0][0][2].shape[1], dtype=torch.bool, device=dev)
 
-        # Pass 1, no grad: dsm and the reference's dsm, to form the detached group weight `w` and to
-        # decide the winners. Done separately so pass 2 can accumulate gradients one kept step at a
-        # time -- four simultaneous forward/backward passes at batch 512 does not fit.
+        zs, alive_m = [], []
+        for g in range(G):
+            zg, ag = [], []
+            for k in range(K):
+                obs_m, gmask, toks, scal, x0, al = keptG[g][k]
+                z, _ = build_state_elem(x0, gmask, t_shared, noise=eps[k])
+                zg.append(z)
+                ag.append(al.float())
+            zs.append(zg)
+            alive_m.append(ag)
+
+        # Pass 1, no grad: dsm under the policy and under the FROZEN reference, for the group weight.
         with torch.inference_mode():
-            d_ng, d_ref = [], []
-            for z, (x_obs, obs_m, gmask, toks, scal, x0) in zip(zs, kept):
+            dn = torch.zeros(G, B, device=dev)
+            dr = torch.zeros(G, B, device=dev)
+            for g in range(G):
+                for k in range(K):
+                    obs_m, gmask, toks, scal, x0, al = keptG[g][k]
+                    z = zs[g][k]
+                    xh = model.policy(z, obs_m, t_shared, text, pooled, tlen, scal,
+                                      extra_tokens=toks, extra_valid=ones_tok)
+                    xr = ref.policy(z, obs_m, t_shared, text, pooled, tlen, scal,
+                                    extra_tokens=toks, extra_valid=ones_tok)
+                    dn[g] += dsm_per_sample(*velocity_pair(xh, x0, z, t_shared), gmask) / K
+                    dr[g] += dsm_per_sample(*velocity_pair(xr, x0, z, t_shared), gmask) / K
+        dsm_ng, ref_dsm = dn.clone(), dr.clone()
+        w = torch.sigmoid((adv * args.beta_dpo * (dsm_ng - ref_dsm)).mean(0))     # [B], one per group
+        # ThermoDPO-weighted, in THIS repo's convention (t = 1 clean): t^2, so the winner anchor is
+        # strongest at the clean end, which is where terminal-sample drift appears.
+        anchor_w = t_shared ** 2
+        win = (adv > 0).float()
+
+        opt.zero_grad(set_to_none=True)
+        acc = dict(dgpo=0.0, anch=0.0, bc=0.0)
+        nstep = G * K
+        for g in range(G):
+            for k in range(K):
+                obs_m, gmask, toks, scal, x0, al = keptG[g][k]
+                z = zs[g][k]
+                alf = alive_m[g][k]
                 xh = model.policy(z, obs_m, t_shared, text, pooled, tlen, scal,
                                   extra_tokens=toks, extra_valid=ones_tok)
-                xr = ref.policy(z, obs_m, t_shared, text, pooled, tlen, scal,
-                                extra_tokens=toks, extra_valid=ones_tok)
-                d_ng.append(dsm_per_sample(*velocity_pair(xh, x0, z, t_shared), gmask))
-                d_ref.append(dsm_per_sample(*velocity_pair(xr, x0, z, t_shared), gmask))
-        dsm_ng = torch.stack(d_ng, 0).mean(0).clone()
-        ref_dsm = torch.stack(d_ref, 0).mean(0).clone()
-        w = torch.sigmoid((adv * args.beta_dpo * (dsm_ng - ref_dsm)).view(NG, G).mean(1))
-        wrep = w.repeat_interleave(G)
-        win = (adv > 0).float()
-        # ThermoDPO-weighted: (1-t)^2 on the winner reconstruction term.
-        anchor_w = (1.0 - t_shared) ** 2
-
-        # Pass 2, with grad, accumulated over the kept steps.
-        opt.zero_grad(set_to_none=True)
-        acc_dgpo = acc_anchor = 0.0
-        for z, (x_obs, obs_m, gmask, toks, scal, x0) in zip(zs, kept):
-            xh = model.policy(z, obs_m, t_shared, text, pooled, tlen, scal,
-                              extra_tokens=toks, extra_valid=ones_tok)
-            d = dsm_per_sample(*velocity_pair(xh, x0, z, t_shared), gmask)
-            l_dgpo = (wrep * adv * d).mean()
-            l_anch = (win * anchor_w * d).sum() / win.sum().clamp_min(1.0)
-            (l_dgpo + args.w_anchor * l_anch).div(len(kept)).backward()
-            acc_dgpo += float(l_dgpo) / len(kept)
-            acc_anchor += float(l_anch) / len(kept)
+                d = dsm_per_sample(*velocity_pair(xh, x0, z, t_shared), gmask)
+                l_dgpo = (w * adv[g] * alf * d).mean()
+                l_anch = ((win[g] * alf) * anchor_w * d).sum() / (win[g] * alf).sum().clamp_min(1.0)
+                if args.w_bc:
+                    with torch.inference_mode():
+                        xb = ref.policy(z, obs_m, t_shared, text, pooled, tlen, scal,
+                                        extra_tokens=toks, extra_valid=ones_tok)
+                    l_bc = (((xh - xb.clone()) ** 2) * gmask).sum() / gmask.sum().clamp_min(1.0)
+                else:
+                    l_bc = torch.zeros((), device=dev)
+                (l_dgpo + args.w_anchor * l_anch + args.w_bc * l_bc).div(nstep).backward()
+                acc["dgpo"] += float(l_dgpo) / nstep
+                acc["anch"] += float(l_anch) / nstep
+                acc["bc"] += float(l_bc) / nstep
         gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         opt.step()
-        dsm, loss_dgpo, loss_anchor = dsm_ng, acc_dgpo, acc_anchor
-        loss = loss_dgpo + args.w_anchor * loss_anchor
-        with torch.no_grad():
-            for pm, pr in zip(model.policy.parameters(), ref.policy.parameters()):
-                pr.mul_(args.ema).add_(pm, alpha=1 - args.ema)
 
-        m = dict(iter=it, captions=NG, fall=float(fell.float().mean()),
-                 surv=float((fall_step.float() / args.episode_steps).mean()),
-                 r_sem=float(r_sem.mean()), judge_sim=float(judge_sim.mean()),
+        m = dict(iter=it, captions=B, group=G, t=float(t_shared[0]),
+                 fall=float(np.mean(ep_fall)), surv=float(R_surv.mean()),
+                 r_sem=float(torch.nan_to_num(R_sem, nan=0.0).sum() / torch.isfinite(R_sem).sum()),
+                 judge_sim=ep_jsim, manifold_knn=(float(np.mean(ep_man)) if ep_man else float("nan")),
+                 v_act=float(np.mean(ep_vratio)),
+                 sd_surv=float(sd_surv), sd_sem=float(sd_sem),
+                 use_surv=use_surv, use_sem=use_sem,
                  adv_abs=float(adv.abs().mean()), live_groups=int(live.sum()),
-                 dsm=float(dsm.mean()), ref_dsm=float(ref_dsm.mean()), w=float(w.mean()),
-                 loss=loss, loss_dgpo=loss_dgpo, loss_anchor=loss_anchor,
+                 dsm=float(dsm_ng.mean()), ref_dsm=float(ref_dsm.mean()),
+                 w=float(w.mean()), w_std=float(w.std()),
+                 loss_dgpo=acc["dgpo"], loss_anchor=acc["anch"], loss_bc=acc["bc"],
                  gn=float(gn), minutes=(time.time() - t0) / 60)
         hist_json.append(m)
         (out / "history.json").write_text(json.dumps(hist_json, indent=1))
-        print(f"it {it} fall {m['fall']:.3f} surv {m['surv']:.3f} r_sem {m['r_sem']:.3f} "
-              f"judge {m['judge_sim']:.3f} w {m['w']:.3f} dsm {m['dsm']:.4f} "
-              f"anch {m['loss_anchor']:.4f} gn {m['gn']:.2f} live {m['live_groups']}/{NG} "
-              f"{m['minutes']:.1f}min", flush=True)
+        print(f"it {it} fall {m['fall']:.3f} r_sem {m['r_sem']:.3f} judge {m['judge_sim']:.3f} "
+              f"knn {m['manifold_knn']:.3f} w {m['w']:.3f}+-{m['w_std']:.3f} dsm {m['dsm']:.4f}/"
+              f"{m['ref_dsm']:.4f} sd(surv,sem) {m['sd_surv']:.3f},{m['sd_sem']:.3f} "
+              f"live {m['live_groups']}/{B} gn {m['gn']:.2f} {m['minutes']:.1f}min", flush=True)
 
         timed = args.max_hours and (time.time() - t0) / 3600 >= args.max_hours
         if it % args.save_every == 0 or it == args.iters or timed:
-            torch.save(dict(model=model.state_dict(), policy_kw=ck["policy_kw"], args=ta,
-                            dgpo_args=vars(args), iter=it), out / "latest.pt")
+            torch.save(dict(model=model.state_dict(), opt=opt.state_dict(),
+                            policy_kw=ck["policy_kw"], args=ta, dgpo_args=vars(args), iter=it),
+                       out / "latest.pt")
+            torch.save(dict(model=model.state_dict(), policy_kw=ck["policy_kw"], args=ta, iter=it),
+                       out / f"iter_{it}.pt")      # keeping snapshots removes the no-recovery trap
         if timed:
             print(f"stopping at iteration {it}: --max-hours {args.max_hours}", flush=True)
             break
