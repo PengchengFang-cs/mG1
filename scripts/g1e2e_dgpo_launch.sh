@@ -23,6 +23,7 @@ python -u scripts/g1e2e_train_dgpo.py \
   --text-cache $R/data/g1_e2e/text_clipL14_full \
   --tmr $R/outputs/g1e2e/tmr_s0/best.pt,$R/outputs/g1e2e/tmr_s1/best.pt \
   --tmr-judge $R/outputs/g1e2e/tmr_s2/best.pt \
+  --manifold-from $R/data/g1_e2e/rollouts_test.ref.pkl \
   --out "$OUT" --iters "$ITERS" --max-hours "$HOURS" --device cuda:0 "$@"
 echo "### $TAG TRAIN_EXIT=$? $(date -Is)"
 [ -f "$OUT/latest.pt" ] || { echo "### $TAG no checkpoint, stopping"; exit 1; }
