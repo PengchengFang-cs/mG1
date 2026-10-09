@@ -75,6 +75,16 @@ def main():
     ap.add_argument("--npz", nargs="+", required=True, help="label=path/to.bodypos.npz (needs proprio)")
     ap.add_argument("--real", default=None, help="recorded robot rollouts, the FID reference")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--manifold-knn", type=int, default=10,
+                    help="k for the manifold monitor. InfoRM (arXiv 2402.09345) finds that "
+                         "over-optimised samples show up as OUTLIERS in the reward model's latent "
+                         "space and proposes a separation index to detect them; this is that idea with "
+                         "the recorded robot motions (--real) as the manifold. For each clip we take "
+                         "the mean distance from its motion embedding to its k nearest recorded "
+                         "embeddings. The image-side papers cannot do this -- 'Manifold Drift in Flow "
+                         "Preference Optimization' (arXiv 2608.20011) states it has no direct manifold "
+                         "metric for real images and has to infer drift from held-out rewards and "
+                         "human inspection. We have 136k recorded trajectories, so we can measure it.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
@@ -171,7 +181,14 @@ def main():
                     diversity=float(calculate_diversity(ems, min(300, len(ems) - 1))),
                     n_items=int(n)), ems
 
-    out, real_stats = {}, None
+    def knn_dist(q, ref, k, exclude_self=False):
+        """Mean distance from each row of q to its k nearest rows of ref."""
+        d = torch.cdist(torch.from_numpy(q), torch.from_numpy(ref))
+        if exclude_self:
+            d.fill_diagonal_(float("inf"))
+        return d.topk(k, dim=1, largest=False).values.mean(1).numpy()
+
+    out, real_stats, real_em, knn_p99 = {}, None, None, None
     rng0 = np.random.RandomState(args.seed)
     for label, items in rows:
         if len(items) < BATCH:
@@ -182,12 +199,26 @@ def main():
         if real_stats is None:
             real_stats = calculate_activation_statistics(ems)      # the first row is the real set
             s["fid"] = 0.0
+            real_em = ems
+            # The recorded motions' OWN leave-one-out k-NN distances set the scale, so the threshold
+            # is a property of real robot motion rather than a number chosen by hand.
+            own = knn_dist(ems, ems, args.manifold_knn, exclude_self=True)
+            knn_p99 = float(np.percentile(own, 99))
+            s["manifold_knn"] = float(own.mean())
+            s["manifold_outlier_frac"] = float((own > knn_p99).mean())
+            s["manifold_p99_threshold"] = knn_p99
+            print(f"  manifold: recorded motion's own mean {args.manifold_knn}-NN distance "
+                  f"{own.mean():.3f}, p99 threshold {knn_p99:.3f}", flush=True)
         else:
             mu, cov = calculate_activation_statistics(ems)
             s["fid"] = float(calculate_frechet_distance(real_stats[0], real_stats[1], mu, cov))
+            kd = knn_dist(ems, real_em, args.manifold_knn)
+            s["manifold_knn"] = float(kd.mean())
+            s["manifold_outlier_frac"] = float((kd > knn_p99).mean())
         out[label] = s
         print(f"{label:28s} R@1 {s['top1']:.4f}  R@2 {s['top2']:.4f}  R@3 {s['top3']:.4f}  "
               f"FID {s['fid']:8.3f}  MM-Dist {s['mm_dist']:.3f}  Div {s['diversity']:.3f}  "
+              f"kNN {s['manifold_knn']:6.3f}  off-manifold {100 * s['manifold_outlier_frac']:5.1f}%  "
               f"({s['n_items']})", flush=True)
     del rng0
 
@@ -195,6 +226,9 @@ def main():
     print(f"\nwrote {args.out}")
     print(f"chance R@1 = {1 / BATCH:.4f}. Our own retrieval model, trained on robot motion with the "
           f"512 evaluation clips held out. Comparable between these rows, NOT across papers.")
+    print(f"off-manifold % = clips whose {args.manifold_knn}-NN distance to recorded robot motion "
+          f"exceeds that recorded motion's OWN 99th percentile. Real motion scores ~1% by "
+          f"construction; a policy drifting off the manifold of feasible robot motion scores high.")
 
 
 if __name__ == "__main__":

@@ -80,6 +80,16 @@ def main():
                          "--holdout-n clips are removed from TRAINING so scoring is not memorisation")
     ap.add_argument("--holdout-n", type=int, default=512)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--slice", default="",
+                    help="i/n -- keep only clip-slice i of n, partitioned by a stable hash of the "
+                         "clip key. Used to train several retrieval models on DISJOINT data so an "
+                         "ensemble's members fail differently: Coste et al. (arXiv 2310.02743) show "
+                         "that averaging an ensemble is NOT conservative (one member overestimating "
+                         "is enough to be exploited) while taking the MINIMUM is, with no "
+                         "hyperparameter. Different seeds alone would leave the members sharing every "
+                         "data idiosyncrasy. Note WARM-style weight averaging is NOT applicable here: "
+                         "it needs the members to share a pretrained init so they stay linearly mode "
+                         "connected, and these are trained from scratch.")
     ap.add_argument("--max-reps", type=int, default=20,
                     help="domain-randomised passes kept per clip; 20 is all of them")
     ap.add_argument("--drop-failed", type=int, default=1)
@@ -122,8 +132,18 @@ def main():
 
     wv = WordVectorizer(GLOVE_DIR, "our_vab")
 
+    keep_slice = None
+    if args.slice:
+        import hashlib
+        si, sn = (int(v) for v in args.slice.split("/"))
+        assert 0 <= si < sn, args.slice
+        # A stable hash, not Python's randomised hash(), so the partition is identical across runs.
+        keep_slice = lambda k: int(hashlib.md5(k.encode()).hexdigest(), 16) % sn == si
+        print(f"slice {si}/{sn}: keeping the clips whose md5 falls in bucket {si}", flush=True)
+
     def build(paths, drop_keys, tag, max_reps):
         feats, texts, n_skip_tok, n_skip_short, n_fail, n_held = [], [], 0, 0, 0, 0
+        n_slice = 0
         per_clip = {}
         for p in paths:
             d = joblib.load(p)
@@ -136,6 +156,9 @@ def main():
                     n_fail += 1
                     continue
                 if per_clip.get(bk, 0) >= max_reps:
+                    continue
+                if keep_slice is not None and not keep_slice(bk):
+                    n_slice += 1
                     continue
                 f = motion_feature(v["proprio"], float(v.get("fps", 50)))
                 if len(f) < MIN_LEN:
@@ -151,12 +174,15 @@ def main():
                 texts.append(toks)
             del d
         print(f"{tag}: {len(feats)} trajectories over {len(per_clip)} clips "
-              f"(held out {n_held}, failed {n_fail}, too short {n_skip_short}, no tokens {n_skip_tok})",
+              f"(held out {n_held}, other slices {n_slice}, failed {n_fail}, "
+              f"too short {n_skip_short}, no tokens {n_skip_tok})",
               flush=True)
         return feats, texts
 
     tr_f, tr_t = build([s for s in args.rollouts.split(",")], holdout, "train", args.max_reps)
+    _ks, keep_slice = keep_slice, None       # the test split is NEVER sliced
     te_f, te_t = build([args.rollouts_test], set(), "test", 1)
+    keep_slice = _ks
     assert len(tr_f) > args.batch and len(te_f) >= BATCH
 
     # ---- normalisation, from the training split only ---------------------------------------------
