@@ -105,6 +105,14 @@ def main():
                          "varied and three quarters of the phase range was never trained.")
     ap.add_argument("--iters", type=int, default=500)
     ap.add_argument("--lr", type=float, default=1e-5)
+    ap.add_argument("--epochs", type=int, default=4,
+                    help="gradient passes over one batch of rollouts. The rollout is 15 of the 16.7 "
+                         "minutes an iteration takes, so extra passes are nearly free, and without "
+                         "them 11 hours buys only ~40 gradient steps for an 86M-parameter policy. The "
+                         "reuse is UNCORRECTED off-policy: `w` and the advantages are fixed from the "
+                         "rollout, and the reference implementation offers an optional PPO-style clip "
+                         "on exp(-dsm + dsm_old) for exactly this, which is not implemented here. Kept "
+                         "small, and bounded by lr 1e-5 with gradient clipping.")
     ap.add_argument("--beta-dpo", type=float, default=30.0, help="DGPO recipe: 10-100 with a frozen ref")
     ap.add_argument("--adv-clip", type=float, default=5.0)
     ap.add_argument("--live-frac", type=float, default=0.1,
@@ -398,9 +406,16 @@ def main():
         assert dur_s.shape[0] == B, f"{dur_s.shape[0]} motion lengths for {B} envs"
         n_env = (dur_s * CONTROL_HZ).ceil().long().clamp_min(1)
 
-        miss = [k for k in base if k not in pos_by_key]
-        assert not miss, f"{len(miss)} captions have no POS tokens, e.g. {miss[:3]}"
-        we, po, cl = zip(*[enc_pos(pos_by_key[k][0]) for k in base])
+        # A caption whose POS tokens cannot be read gets NO semantic reward; its env still contributes
+        # a survival signal. A review measured this set as empty over the first 512 clips, but the
+        # caption window advances every iteration and 009831 fails `read_texts`, so it is not empty --
+        # and asserting here refused the whole run over one clip.
+        has_pos = torch.tensor([k in pos_by_key for k in base], device=dev)
+        if not bool(has_pos.all()):
+            miss = [k for k in base if k not in pos_by_key]
+            print(f"  {len(miss)} of {B} captions have no POS tokens (e.g. {miss[:3]}); "
+                  f"those envs get survival only", flush=True)
+        we, po, cl = zip(*[enc_pos(pos_by_key.get(k, [["unk/OTHER"]])[0]) for k in base])
         cl = np.asarray(cl)
         order = np.argsort(-cl, kind="stable")
         inv = torch.tensor(np.argsort(order), device=dev)
@@ -504,7 +519,9 @@ def main():
                 src = prop_buf[j, :nv].T[None]
                 feat[j, :int(m20[j])] = torch.nn.functional.interpolate(
                     src, size=int(m20[j]), mode="linear", align_corners=True)[0].T
-            sc = n_valid >= 100                      # below 40 frames the encoder is out of distribution
+            # Below 40 frames the encoder is out of distribution; without POS tokens there is no
+            # text side to compare against. Either way the semantic term is absent, not zero.
+            sc = (n_valid >= 100) & has_pos
             ml = m20.clone()
             srt = torch.argsort(ml, descending=True)
             isrt = torch.argsort(srt)
@@ -592,32 +609,33 @@ def main():
         anchor_w = t_shared ** 2
         win = (adv > 0).float()
 
-        opt.zero_grad(set_to_none=True)
         acc = dict(dgpo=0.0, anch=0.0, bc=0.0)
         nstep = G * K
-        for g in range(G):
-            for k in range(K):
-                obs_m, gmask, toks, scal, x0, al = keptG[g][k]
-                z = zs[g][k]
-                alf = alive_m[g][k]
-                xh = model.policy(z, obs_m, t_shared, text, pooled, tlen, scal,
-                                  extra_tokens=toks, extra_valid=ones_tok)
-                d = dsm_per_sample(*velocity_pair(xh, x0, z, t_shared), gmask)
-                l_dgpo = (w * adv[g] * alf * d).mean()
-                l_anch = ((win[g] * alf) * anchor_w * d).sum() / (win[g] * alf).sum().clamp_min(1.0)
-                if args.w_bc:
-                    with torch.inference_mode():
-                        xb = ref.policy(z, obs_m, t_shared, text, pooled, tlen, scal,
-                                        extra_tokens=toks, extra_valid=ones_tok)
-                    l_bc = (((xh - xb.clone()) ** 2) * gmask).sum() / gmask.sum().clamp_min(1.0)
-                else:
-                    l_bc = torch.zeros((), device=dev)
-                (l_dgpo + args.w_anchor * l_anch + args.w_bc * l_bc).div(nstep).backward()
-                acc["dgpo"] += float(l_dgpo) / nstep
-                acc["anch"] += float(l_anch) / nstep
-                acc["bc"] += float(l_bc) / nstep
-        gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-        opt.step()
+        for _ep in range(args.epochs):
+          opt.zero_grad(set_to_none=True)
+          for g in range(G):
+              for k in range(K):
+                  obs_m, gmask, toks, scal, x0, al = keptG[g][k]
+                  z = zs[g][k]
+                  alf = alive_m[g][k]
+                  xh = model.policy(z, obs_m, t_shared, text, pooled, tlen, scal,
+                                    extra_tokens=toks, extra_valid=ones_tok)
+                  d = dsm_per_sample(*velocity_pair(xh, x0, z, t_shared), gmask)
+                  l_dgpo = (w * adv[g] * alf * d).mean()
+                  l_anch = ((win[g] * alf) * anchor_w * d).sum() / (win[g] * alf).sum().clamp_min(1.0)
+                  if args.w_bc:
+                      with torch.inference_mode():
+                          xb = ref.policy(z, obs_m, t_shared, text, pooled, tlen, scal,
+                                          extra_tokens=toks, extra_valid=ones_tok)
+                      l_bc = (((xh - xb.clone()) ** 2) * gmask).sum() / gmask.sum().clamp_min(1.0)
+                  else:
+                      l_bc = torch.zeros((), device=dev)
+                  (l_dgpo + args.w_anchor * l_anch + args.w_bc * l_bc).div(nstep).backward()
+                  acc["dgpo"] += float(l_dgpo) / nstep / args.epochs
+                  acc["anch"] += float(l_anch) / nstep / args.epochs
+                  acc["bc"] += float(l_bc) / nstep / args.epochs
+          gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+          opt.step()
 
         m = dict(iter=it, captions=B, group=G, t=float(t_shared[0]),
                  fall=float(np.mean(ep_fall)), surv=float(R_surv.mean()),
@@ -630,7 +648,7 @@ def main():
                  dsm=float(dsm_ng.mean()), ref_dsm=float(ref_dsm.mean()),
                  w=float(w.mean()), w_std=float(w.std()),
                  loss_dgpo=acc["dgpo"], loss_anchor=acc["anch"], loss_bc=acc["bc"],
-                 gn=float(gn), minutes=(time.time() - t0) / 60)
+                 gn=float(gn), epochs=args.epochs, minutes=(time.time() - t0) / 60)
         hist_json.append(m)
         (out / "history.json").write_text(json.dumps(hist_json, indent=1))
         print(f"it {it} fall {m['fall']:.3f} r_sem {m['r_sem']:.3f} judge {m['judge_sim']:.3f} "
