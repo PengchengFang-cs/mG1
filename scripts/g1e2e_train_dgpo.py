@@ -181,6 +181,14 @@ def main():
 
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
+    # The evaluation script reads the normalisers from the CHECKPOINT'S OWN directory, so a checkpoint
+    # written anywhere else is unloadable without them. v2rft's closed loop died on exactly this after
+    # the training finished.
+    import shutil
+    for _n in ("stats.npz", "intent_latent_stats.npz"):
+        _src = Path(args.policy).resolve().parent / _n
+        if _src.exists() and not (out / _n).exists():
+            shutil.copy2(_src, out / _n)
     refs = Path(args.refs).resolve()
     policy_path = Path(args.policy).resolve()
     text_cache = Path(args.text_cache).resolve()
